@@ -1,10 +1,11 @@
 """Database access package for PuntLab.
 
 Purpose: expose the canonical SQLAlchemy async connection helpers and ORM
-models used throughout the agent runtime.
-Scope: persistence primitives for fixtures, analyses, accumulators, users, and
-delivery logs.
-Dependencies: configured through PostgreSQL connection settings and SQLAlchemy.
+models and query helpers used throughout the agent runtime.
+Scope: persistence primitives for fixtures, analyses, accumulators, users,
+delivery logs, and pipeline execution state.
+Dependencies: configured through PostgreSQL connection settings and SQLAlchemy,
+with repository helpers implemented in `src.db.queries`.
 """
 
 from src.db.connection import (
@@ -31,6 +32,40 @@ from src.db.models import (
     TeamStats,
     User,
 )
+from src.db.queries import (
+    AccumulatorCreate,
+    AccumulatorLegCreate,
+    CompetitionUpsert,
+    DeliveryLogCreate,
+    FixtureUpsert,
+    InjuryCreate,
+    JsonValue,
+    MatchAnalysisCreate,
+    OddsUpsert,
+    PaymentCreate,
+    PipelineRunCreate,
+    PipelineRunUpdate,
+    SportName,
+    SubscriptionTier,
+    TeamStatsCreate,
+    create_accumulator_with_legs,
+    create_delivery_logs,
+    create_payment,
+    create_pipeline_run,
+    get_competition_by_league_code,
+    get_pipeline_run,
+    get_users_by_tier,
+    insert_match_analyses,
+    insert_team_stats_snapshots,
+    list_active_competitions,
+    list_fixtures_for_date,
+    replace_fixture_injuries,
+    update_pipeline_run,
+    upsert_competition,
+    upsert_fixture,
+    upsert_fixtures,
+    upsert_odds_rows,
+)
 
 __all__ = [
     "Accumulator",
@@ -46,11 +81,43 @@ __all__ = [
     "PipelineRun",
     "TeamStats",
     "User",
+    "AccumulatorCreate",
+    "AccumulatorLegCreate",
+    "CompetitionUpsert",
+    "DeliveryLogCreate",
+    "FixtureUpsert",
+    "InjuryCreate",
+    "JsonValue",
+    "MatchAnalysisCreate",
+    "OddsUpsert",
+    "PaymentCreate",
+    "PipelineRunCreate",
+    "PipelineRunUpdate",
+    "SportName",
+    "SubscriptionTier",
+    "TeamStatsCreate",
     "create_engine",
     "create_session_factory",
+    "create_accumulator_with_legs",
+    "create_delivery_logs",
+    "create_payment",
+    "create_pipeline_run",
     "dispose_engine",
+    "get_competition_by_league_code",
     "get_engine",
+    "get_pipeline_run",
     "get_session",
     "get_session_factory",
+    "get_users_by_tier",
+    "insert_match_analyses",
+    "insert_team_stats_snapshots",
+    "list_active_competitions",
+    "list_fixtures_for_date",
     "normalize_database_url",
+    "replace_fixture_injuries",
+    "update_pipeline_run",
+    "upsert_competition",
+    "upsert_fixture",
+    "upsert_fixtures",
+    "upsert_odds_rows",
 ]
