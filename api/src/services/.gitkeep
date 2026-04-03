@@ -1,0 +1,2 @@
+Service modules for the PuntLab Fastify API live in this directory.
+Scope: payment, subscription, and domain-specific business logic helpers.

@@ -1,0 +1,2 @@
+Middleware modules for the PuntLab Fastify API live in this directory.
+Scope: authentication, API key validation, and request-level guards.

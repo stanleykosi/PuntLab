@@ -1,0 +1,2 @@
+Route modules for the PuntLab Fastify API live in this directory.
+Scope: endpoint registration files such as `today.ts`, `history.ts`, and admin routes.
