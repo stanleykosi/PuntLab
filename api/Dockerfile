@@ -12,8 +12,6 @@ COPY package-lock.json ./package-lock.json
 COPY tsconfig.json ./tsconfig.json
 COPY src ./src
 
-ENV PRISMA_SKIP_POSTINSTALL_GENERATE=true
-
 RUN npm ci \
     && npm run build
 
