@@ -1,8 +1,29 @@
 """External data provider integrations for PuntLab.
 
-Purpose: reserves the namespace for sports data, odds, and news providers.
-Scope: API-Football, Football-Data.org, The Odds API, Tavily, RSS, and NBA data.
-Dependencies: will be orchestrated by the ingestion stage.
+Purpose: expose the canonical shared provider infrastructure and reserve the
+namespace for concrete sports, odds, and news integrations.
+Scope: provider base classes plus future API-Football, Football-Data.org,
+The Odds API, Tavily, RSS, and NBA provider implementations.
+Dependencies: concrete providers reuse `src.providers.base` and are
+orchestrated by the ingestion stage.
 """
 
-__all__ = []
+from src.providers.base import (
+    CachedHTTPResponse,
+    DataProvider,
+    ProviderError,
+    RateLimitedClient,
+    RateLimitExhausted,
+    RateLimitPolicy,
+    RetryConfig,
+)
+
+__all__ = [
+    "CachedHTTPResponse",
+    "DataProvider",
+    "ProviderError",
+    "RateLimitExhausted",
+    "RateLimitPolicy",
+    "RateLimitedClient",
+    "RetryConfig",
+]
