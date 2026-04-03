@@ -1,0 +1,50 @@
+# Repository-wide ignore rules for the PuntLab monorepo.
+# Scope: excludes generated Python, Node.js, Next.js, Docker, and local env
+# artifacts so only source and intentional configuration are committed.
+# Dependencies: `.env.example` remains tracked as the canonical template.
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Documentation
+*.md
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Docker / local service data
+postgres-data/
+redis-data/
+
+# Supabase local tooling
+.supabase/

@@ -1,0 +1,144 @@
+# Root Docker Compose definition for local PuntLab development.
+# Scope: wires together the canonical local service topology described in the
+# technical spec so infrastructure and app services share one configuration.
+# Dependencies: values are sourced from a local `.env` file based on
+# `.env.example`; service Dockerfiles are added in later plan steps.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: puntlab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-puntlab}
+      POSTGRES_USER: ${POSTGRES_USER:-puntlab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-puntlab}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-puntlab} -d ${POSTGRES_DB:-puntlab}
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: puntlab-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: puntlab-agent
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    working_dir: /app
+    command: ["python", "-m", "src.main"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://puntlab:puntlab@postgres:5432/puntlab}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      API_FOOTBALL_KEY: ${API_FOOTBALL_KEY:-}
+      FOOTBALL_DATA_API_KEY: ${FOOTBALL_DATA_API_KEY:-}
+      THE_ODDS_API_KEY: ${THE_ODDS_API_KEY:-}
+      BALLDONTLIE_API_KEY: ${BALLDONTLIE_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      ADMIN_TELEGRAM_IDS: ${ADMIN_TELEGRAM_IDS:-}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+      PAYSTACK_WEBHOOK_SECRET: ${PAYSTACK_WEBHOOK_SECRET:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      PIPELINE_START_HOUR: ${PIPELINE_START_HOUR:-7}
+      PUBLISH_HOUR: ${PUBLISH_HOUR:-10}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./agent:/app
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: puntlab-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    working_dir: /app
+    command: ["npm", "run", "dev"]
+    environment:
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL:-postgresql://puntlab:puntlab@postgres:5432/puntlab}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+      PAYSTACK_WEBHOOK_SECRET: ${PAYSTACK_WEBHOOK_SECRET:-}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-3001}:3001"
+    volumes:
+      - ./api:/app
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: puntlab-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    working_dir: /app
+    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0"]
+    environment:
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      - ./web:/app
+
+volumes:
+  postgres-data:
+  redis-data:
