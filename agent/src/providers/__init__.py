@@ -20,6 +20,13 @@ from src.providers.base import (
     RetryConfig,
 )
 from src.providers.football_data import FootballDataProvider
+from src.providers.orchestrator import (
+    CompetitionProviderRoute,
+    InjuryFetchResult,
+    OddsFetchResult,
+    ProviderOrchestrator,
+    StatsFetchResult,
+)
 from src.providers.rss_feeds import DEFAULT_RSS_FEEDS, RSSFeedDefinition, RSSFeedProvider
 from src.providers.tavily_search import TavilySearchProvider
 from src.providers.the_odds_api import TheOddsAPIProvider
@@ -28,16 +35,21 @@ __all__ = [
     "APIFootballProvider",
     "BallDontLieProvider",
     "CachedHTTPResponse",
+    "CompetitionProviderRoute",
     "DataProvider",
     "DEFAULT_RSS_FEEDS",
     "FootballDataProvider",
+    "InjuryFetchResult",
+    "OddsFetchResult",
     "ProviderError",
+    "ProviderOrchestrator",
     "RateLimitExhausted",
     "RateLimitPolicy",
     "RateLimitedClient",
     "RSSFeedDefinition",
     "RSSFeedProvider",
     "RetryConfig",
+    "StatsFetchResult",
     "TavilySearchProvider",
     "TheOddsAPIProvider",
 ]

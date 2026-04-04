@@ -427,7 +427,7 @@ class FootballDataProvider(DataProvider):
             away_wins=away_wins_by_team.get(team_id, 0),
             avg_goals_scored=avg_goals_scored,
             avg_goals_conceded=avg_goals_conceded,
-            advanced_metrics={"goal_difference": float(goal_difference)},
+            advanced_metrics={"goal_difference": float(goal_difference or 0)},
         )
 
     def _normalize_team_metadata(
@@ -649,6 +649,8 @@ class FootballDataProvider(DataProvider):
         """Coerce a provider payload field into a non-negative integer."""
 
         coerced = cls._coerce_int(value, field_name=field_name, default=0)
+        if coerced is None:
+            return 0
         if coerced < 0:
             raise ProviderError("football-data", f"{field_name} must be non-negative.")
         return coerced
