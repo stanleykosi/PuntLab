@@ -18,11 +18,13 @@ from src.providers.base import (
     RateLimitPolicy,
     RetryConfig,
 )
+from src.providers.football_data import FootballDataProvider
 
 __all__ = [
     "APIFootballProvider",
     "CachedHTTPResponse",
     "DataProvider",
+    "FootballDataProvider",
     "ProviderError",
     "RateLimitExhausted",
     "RateLimitPolicy",
