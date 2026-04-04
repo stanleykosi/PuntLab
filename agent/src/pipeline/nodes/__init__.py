@@ -8,5 +8,6 @@ Dependencies: imported by the pipeline graph and stage-level tests.
 
 from src.pipeline.nodes.ingestion import ingestion_node
 from src.pipeline.nodes.research import research_node
+from src.pipeline.nodes.scoring import scoring_node
 
-__all__ = ["ingestion_node", "research_node"]
+__all__ = ["ingestion_node", "research_node", "scoring_node"]
