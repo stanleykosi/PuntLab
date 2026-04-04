@@ -34,6 +34,8 @@ def test_resolved_market_serializes_resolution_metadata() -> None:
         selection="home",
         odds=1.82,
         provider="sportybet",
+        provider_market_name="Full Time Result",
+        provider_selection_name="Home",
         sportybet_available=True,
         resolution_source=ResolutionSource.SPORTYBET_API,
         sportybet_market_id=45,

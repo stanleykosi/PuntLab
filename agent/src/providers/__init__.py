@@ -8,6 +8,7 @@ Dependencies: concrete providers reuse `src.providers.base` and are
 orchestrated by the ingestion stage.
 """
 
+from src.providers.api_football import APIFootballProvider
 from src.providers.base import (
     CachedHTTPResponse,
     DataProvider,
@@ -19,6 +20,7 @@ from src.providers.base import (
 )
 
 __all__ = [
+    "APIFootballProvider",
     "CachedHTTPResponse",
     "DataProvider",
     "ProviderError",

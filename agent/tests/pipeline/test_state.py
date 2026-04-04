@@ -118,6 +118,8 @@ def test_pipeline_state_serializes_all_stage_outputs() -> None:
                 selection="Over",
                 odds=1.85,
                 provider="the-odds-api",
+                provider_market_name="Goals Over/Under",
+                provider_selection_name="Over 2.5",
             )
         ],
         team_stats=[
@@ -225,6 +227,8 @@ def test_pipeline_state_serializes_all_stage_outputs() -> None:
                 selection="Over",
                 odds=1.85,
                 provider="sportybet",
+                provider_market_name="Goals Over/Under",
+                provider_selection_name="Over 2.5",
                 sportybet_available=True,
                 resolution_source=ResolutionSource.SPORTYBET_API,
                 resolved_at=datetime(2026, 4, 3, 6, 50, tzinfo=UTC),

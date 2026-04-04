@@ -89,6 +89,9 @@ class ResolvedMarket(NormalizedOdds):
         assembly and observability.
     """
 
+    market: MarketType = Field(
+        description="Canonical market taxonomy selected by the resolver for downstream use."
+    )
     resolution_source: ResolutionSource = Field(
         description="Resolver path that produced this market."
     )
