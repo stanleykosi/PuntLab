@@ -120,8 +120,8 @@ class LLMProviderConfig(BaseModel):
     secondary_provider: str = "anthropic"
     fallback_provider: str = "openrouter"
     primary_model: str = "gpt-4o"
-    secondary_model: str = "claude"
-    fallback_model: str = "openai/gpt-4.1"
+    secondary_model: str = "claude-sonnet-4-20250514"
+    fallback_model: str = "meta-llama/llama-3-70b-instruct"
 
 
 class DataProviderConfig(BaseModel):
