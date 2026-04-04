@@ -1,8 +1,11 @@
 """Pipeline node namespace for stage-specific execution units.
 
-Purpose: groups the future LangGraph node implementations by pipeline stage.
+Purpose: expose concrete stage-node entry points as they are implemented for
+LangGraph assembly and direct unit testing.
 Scope: ingestion, research, scoring, ranking, approval, and delivery nodes.
-Dependencies: loaded by the pipeline graph module once implemented.
+Dependencies: imported by the pipeline graph and stage-level tests.
 """
 
-__all__ = []
+from src.pipeline.nodes.ingestion import ingestion_node
+
+__all__ = ["ingestion_node"]

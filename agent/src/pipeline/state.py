@@ -16,6 +16,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from src.providers.odds_mapping import OddsMarketCatalog
 from src.schemas.accumulators import AccumulatorSlip, ExplainedAccumulator, ResolvedMarket
 from src.schemas.analysis import MatchContext, MatchScore, RankedMatch
 from src.schemas.common import ensure_timezone_aware, require_non_blank_text
@@ -98,9 +99,19 @@ class PipelineState(BaseModel):
         default_factory=list,
         description="Stage 1 fixture outputs gathered during ingestion.",
     )
+    odds_market_catalog: OddsMarketCatalog = Field(
+        default_factory=OddsMarketCatalog,
+        description=(
+            "Stage 1 full provider-market odds catalog, including both scoreable and "
+            "currently unmapped selections."
+        ),
+    )
     odds_data: list[NormalizedOdds] = Field(
         default_factory=list,
-        description="Stage 1 normalized odds outputs gathered during ingestion.",
+        description=(
+            "Stage 1 canonically mapped, scoreable odds rows derived from the full "
+            "ingested provider market catalog."
+        ),
     )
     team_stats: list[TeamStats] = Field(
         default_factory=list,

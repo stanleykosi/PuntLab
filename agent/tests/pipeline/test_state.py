@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 import pytest
 from src.config import MarketType, SportName
 from src.pipeline.state import ApprovalStatus, PipelineStage, PipelineState
+from src.providers.odds_mapping import build_odds_market_catalog
 from src.schemas.accumulators import (
     AccumulatorLeg,
     ExplainedAccumulator,
@@ -111,6 +112,23 @@ def test_pipeline_state_serializes_all_stage_outputs() -> None:
         current_stage=PipelineStage.APPROVAL,
         errors=["Provider timeout handled via fallback."],
         fixtures=[fixture],
+        odds_market_catalog=build_odds_market_catalog(
+            (
+                NormalizedOdds(
+                    fixture_ref=fixture.get_fixture_ref(),
+                    market=None,
+                    selection="Over 2.5",
+                    odds=1.85,
+                    provider="the-odds-api",
+                    provider_market_name="Goals Over/Under",
+                    provider_selection_name="Over 2.5",
+                    line=2.5,
+                    period="match",
+                    participant_scope="match",
+                    raw_metadata={"sport_key": "soccer_epl"},
+                ),
+            )
+        ),
         odds_data=[
             NormalizedOdds(
                 fixture_ref=fixture.get_fixture_ref(),
@@ -254,6 +272,7 @@ def test_pipeline_state_serializes_all_stage_outputs() -> None:
     assert dumped["current_stage"] == "approval"
     assert dumped["approval_status"] == "approved"
     assert dumped["fixtures"][0]["sportradar_id"] == "sr:match:61301159"
+    assert dumped["odds_market_catalog"]["markets"][0]["provider_market_name"] == "Goals Over/Under"
     assert dumped["delivery_results"][0]["status"] == "sent"
     assert state.explained_accumulators[0].rationale == (
         "The matchup profile supports a goals-first angle."
