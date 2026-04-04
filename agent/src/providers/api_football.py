@@ -84,6 +84,7 @@ _LINE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?P<line>[+-]?\d+(?:\.\d+)?
 _NUMERIC_TEXT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
 _PERCENT_TEXT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[+-]?\d+(?:\.\d+)?%$")
 _NON_METRIC_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
+_REFERENCE_DATA_TTL_SECONDS: Final[int] = 24 * 60 * 60
 _SUPPORTED_TOTAL_MARKET_LINES: Final[dict[float, MarketType]] = {
     0.5: MarketType.OVER_UNDER_05,
     1.5: MarketType.OVER_UNDER_15,
@@ -224,6 +225,7 @@ class APIFootballProvider(DataProvider):
         if bookmaker_id is not None:
             params["bookmaker"] = self._require_positive_int("bookmaker_id", bookmaker_id)
 
+        bet_type_catalog = await self.fetch_odds_bet_types()
         payloads = await self._fetch_paginated_json(
             "/odds",
             params=params,
@@ -233,8 +235,56 @@ class APIFootballProvider(DataProvider):
         normalized_odds: list[NormalizedOdds] = []
         for payload in payloads:
             for response_item in self._extract_response_items(payload):
-                normalized_odds.extend(self._normalize_odds_fixture_response(response_item))
+                normalized_odds.extend(
+                    self._normalize_odds_fixture_response(
+                        response_item,
+                        bet_type_catalog=bet_type_catalog,
+                    )
+                )
         return normalized_odds
+
+    async def fetch_odds_bet_types(
+        self,
+        *,
+        bet_id: int | None = None,
+        search: str | None = None,
+    ) -> dict[int, str]:
+        """Fetch the pre-match bet-type reference catalog from `/odds/bets`.
+
+        Args:
+            bet_id: Optional specific pre-match bet type identifier.
+            search: Optional text filter. Must be at least 3 characters when provided.
+
+        Returns:
+            A mapping of provider bet IDs to their canonical provider-facing names.
+        """
+
+        params: dict[str, object] = {}
+        if bet_id is not None:
+            params["id"] = self._require_positive_int("bet_id", bet_id)
+        if search is not None:
+            normalized_search = search.strip()
+            if len(normalized_search) < 3:
+                raise ValueError("search must be at least 3 characters for /odds/bets.")
+            params["search"] = normalized_search
+
+        payload = await self._fetch_json(
+            "/odds/bets",
+            params=params,
+            cache_ttl_seconds=_REFERENCE_DATA_TTL_SECONDS,
+        )
+
+        catalog: dict[int, str] = {}
+        for response_item in self._extract_response_items(payload):
+            reference_id = self._required_positive_int(
+                response_item.get("id"),
+                field_name="odds.bets.id",
+            )
+            catalog[reference_id] = self._require_text(
+                response_item.get("name"),
+                "odds.bets.name",
+            )
+        return catalog
 
     async def fetch_standings(
         self,
@@ -333,8 +383,8 @@ class APIFootballProvider(DataProvider):
             params["id"] = self._require_positive_int("player_id", player_id)
         if search is not None:
             normalized_search = search.strip()
-            if not normalized_search:
-                raise ValueError("search must not be blank.")
+            if len(normalized_search) < 3:
+                raise ValueError("search must be at least 3 characters for /players.")
             params["search"] = normalized_search
 
         payloads = await self._fetch_paginated_json(
@@ -364,6 +414,7 @@ class APIFootballProvider(DataProvider):
         team_id: int | None = None,
         player_id: int | None = None,
         report_date: date | None = None,
+        timezone: str | None = None,
     ) -> list[InjuryData]:
         """Fetch normalized injury and suspension signals.
 
@@ -406,6 +457,7 @@ class APIFootballProvider(DataProvider):
             params["player"] = self._require_positive_int("player_id", player_id)
         if report_date is not None:
             params["date"] = report_date.strftime(_API_DATE_FORMAT)
+        params["timezone"] = self._resolve_timezone(timezone)
 
         payload = await self._fetch_json(
             "/injuries",
@@ -631,6 +683,8 @@ class APIFootballProvider(DataProvider):
     def _normalize_odds_fixture_response(
         self,
         response_item: Mapping[str, object],
+        *,
+        bet_type_catalog: Mapping[int, str],
     ) -> list[NormalizedOdds]:
         """Normalize one fixture odds response across bookmakers and bet types."""
 
@@ -670,6 +724,16 @@ class APIFootballProvider(DataProvider):
                 bet_data = self._require_mapping(bet, "bet")
                 bet_name = self._require_text(bet_data.get("name"), "bet.name")
                 provider_market_id = bet_data.get("id")
+                reference_bet_id = self._coerce_positive_int(
+                    provider_market_id,
+                    field_name="bet.id",
+                    allow_none=True,
+                )
+                reference_bet_name = (
+                    bet_type_catalog.get(reference_bet_id, bet_name)
+                    if reference_bet_id is not None
+                    else bet_name
+                )
                 values = bet_data.get("values")
                 if not isinstance(values, list):
                     raise ProviderError(
@@ -683,6 +747,7 @@ class APIFootballProvider(DataProvider):
                         fixture_ref=fixture_ref,
                         bookmaker_name=bookmaker_name,
                         bet_name=bet_name,
+                        reference_bet_name=reference_bet_name,
                         provider_market_id=provider_market_id,
                         value_entry=self._require_mapping(value_entry, "bet.value"),
                         last_updated=last_updated,
@@ -697,6 +762,7 @@ class APIFootballProvider(DataProvider):
         fixture_ref: str,
         bookmaker_name: str,
         bet_name: str,
+        reference_bet_name: str,
         provider_market_id: object,
         value_entry: Mapping[str, object],
         last_updated: datetime | None,
@@ -709,13 +775,13 @@ class APIFootballProvider(DataProvider):
             field_name="bet.value.odd",
         )
 
-        normalized_bet_name = self._normalize_phrase(bet_name)
+        normalized_bet_name = self._normalize_phrase(reference_bet_name)
         market: MarketType | None = None
         selection = raw_selection
         line = self._extract_market_line(
             normalized_bet_name,
             raw_selection=raw_selection,
-            bet_name=bet_name,
+            bet_name=reference_bet_name,
         )
 
         if normalized_bet_name in {"match winner", "winner"}:
@@ -747,7 +813,7 @@ class APIFootballProvider(DataProvider):
         if market is None:
             logger.debug(
                 "Preserving unmapped API-Football market bet=%s selection=%s",
-                bet_name,
+                reference_bet_name,
                 raw_selection,
             )
 
@@ -757,7 +823,7 @@ class APIFootballProvider(DataProvider):
             selection=selection,
             odds=odds_value,
             provider=bookmaker_name,
-            provider_market_name=bet_name,
+            provider_market_name=reference_bet_name,
             provider_selection_name=raw_selection,
             sportybet_available=False,
             market_label=bet_name,

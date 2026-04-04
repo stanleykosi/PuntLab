@@ -153,8 +153,26 @@ async def test_fetch_odds_by_fixture_paginates_and_preserves_all_markets() -> No
     """Odds fetches should keep unsupported markets instead of dropping them."""
 
     call_pages: list[str] = []
+    reference_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reference_calls
+        if request.url.path == "/odds/bets":
+            reference_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "errors": [],
+                    "response": [
+                        {"id": 1, "name": "Match Winner"},
+                        {"id": 5, "name": "Goals Over/Under"},
+                        {"id": 7, "name": "Both Teams To Score"},
+                        {"id": 13, "name": "Asian Handicap"},
+                        {"id": 19, "name": "Team To Score First"},
+                    ],
+                },
+                request=request,
+            )
         page = request.url.params["page"]
         call_pages.append(page)
         payload = {
@@ -227,6 +245,7 @@ async def test_fetch_odds_by_fixture_paginates_and_preserves_all_markets() -> No
     odds_rows = await provider.fetch_odds_by_fixture(fixture_id=501)
 
     assert call_pages == ["1", "2"]
+    assert reference_calls == 1
     assert len(odds_rows) == 10
     assert {row.market for row in odds_rows} == {
         MarketType.MATCH_RESULT,
@@ -353,8 +372,12 @@ async def test_fetch_standings_and_player_stats_normalize_nested_payloads() -> N
 async def test_fetch_injuries_and_head_to_head_normalize_provider_payloads() -> None:
     """Injury and H2H fetches should normalize the remaining API-Football domains."""
 
+    injury_query: dict[str, str] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/injuries":
+            nonlocal injury_query
+            injury_query = dict(request.url.params.items())
             return httpx.Response(
                 200,
                 json={
@@ -408,6 +431,7 @@ async def test_fetch_injuries_and_head_to_head_normalize_provider_payloads() -> 
     h2h_fixtures = await provider.fetch_head_to_head(home_team_id=42, away_team_id=49, last=5)
 
     assert len(injuries) == 1
+    assert injury_query == {"fixture": "501", "timezone": "Africa/Lagos"}
     assert injuries[0].fixture_ref == "api-football:501"
     assert injuries[0].player_id == "88"
     assert injuries[0].reason == "Hamstring strain"
@@ -430,5 +454,19 @@ async def test_fetch_injuries_requires_a_real_selector() -> None:
 
     with pytest.raises(ValueError, match="requires at least one selector"):
         await provider.fetch_injuries()
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_player_stats_requires_three_character_search() -> None:
+    """Player search should enforce the provider's documented minimum length."""
+
+    provider, client = build_provider(
+        lambda request: httpx.Response(200, json={"errors": [], "response": []}, request=request)
+    )
+
+    with pytest.raises(ValueError, match="at least 3 characters"):
+        await provider.fetch_player_stats(season=2026, search="ab")
 
     await client.aclose()
