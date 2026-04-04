@@ -7,6 +7,16 @@ schema modules that share the same namespace.
 Dependencies: `src.llm.providers` for runtime model construction.
 """
 
+from src.llm.prompts import (
+    ACCUMULATOR_RATIONALE_PROMPT,
+    LEG_RATIONALE_PROMPT,
+    NEWS_CONTEXT_ANALYSIS_PROMPT,
+    PROMPT_REGISTRY,
+    PROMPT_TASK_KEYS,
+    QUALITATIVE_ASSESSMENT_PROMPT,
+    get_prompt,
+    resolve_prompt_task,
+)
 from src.llm.providers import (
     TASK_LLM_CONFIGS,
     AllProvidersFailedError,
@@ -17,10 +27,18 @@ from src.llm.providers import (
 )
 
 __all__ = [
+    "ACCUMULATOR_RATIONALE_PROMPT",
     "AllProvidersFailedError",
+    "LEG_RATIONALE_PROMPT",
     "LLMTaskConfig",
+    "NEWS_CONTEXT_ANALYSIS_PROMPT",
+    "PROMPT_REGISTRY",
+    "PROMPT_TASK_KEYS",
+    "QUALITATIVE_ASSESSMENT_PROMPT",
     "TASK_LLM_CONFIGS",
     "get_langfuse_handler",
     "get_llm",
+    "get_prompt",
+    "resolve_prompt_task",
     "resolve_task_config",
 ]
