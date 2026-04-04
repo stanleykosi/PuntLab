@@ -25,15 +25,25 @@ from src.llm.providers import (
     get_llm,
     resolve_task_config,
 )
+from src.llm.schemas import (
+    AccumulatorRationale,
+    LegRationale,
+    MatchContext,
+    QualitativeScore,
+)
 
 __all__ = [
     "ACCUMULATOR_RATIONALE_PROMPT",
+    "AccumulatorRationale",
     "AllProvidersFailedError",
     "LEG_RATIONALE_PROMPT",
+    "LegRationale",
     "LLMTaskConfig",
+    "MatchContext",
     "NEWS_CONTEXT_ANALYSIS_PROMPT",
     "PROMPT_REGISTRY",
     "PROMPT_TASK_KEYS",
+    "QualitativeScore",
     "QUALITATIVE_ASSESSMENT_PROMPT",
     "TASK_LLM_CONFIGS",
     "get_langfuse_handler",
