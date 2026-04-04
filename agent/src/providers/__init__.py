@@ -3,12 +3,13 @@
 Purpose: expose the canonical shared provider infrastructure and the concrete
 provider implementations that the ingestion stage composes.
 Scope: provider base classes plus the current API-Football, Football-Data.org,
-and The Odds API integrations.
+BALLDONTLIE, and The Odds API integrations.
 Dependencies: concrete providers reuse `src.providers.base` and are
 orchestrated by the ingestion stage.
 """
 
 from src.providers.api_football import APIFootballProvider
+from src.providers.balldontlie import BallDontLieProvider
 from src.providers.base import (
     CachedHTTPResponse,
     DataProvider,
@@ -23,6 +24,7 @@ from src.providers.the_odds_api import TheOddsAPIProvider
 
 __all__ = [
     "APIFootballProvider",
+    "BallDontLieProvider",
     "CachedHTTPResponse",
     "DataProvider",
     "FootballDataProvider",
