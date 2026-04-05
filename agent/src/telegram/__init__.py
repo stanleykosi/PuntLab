@@ -22,6 +22,12 @@ from src.telegram.commands import (
     parse_slip_number_argument,
     telegram_commands_router,
 )
+from src.telegram.formatters import (
+    format_accumulator_message,
+    format_history_message,
+    format_stats_message,
+    format_welcome_message,
+)
 
 __all__ = [
     "BotRunMode",
@@ -31,6 +37,10 @@ __all__ = [
     "build_dispatcher",
     "build_help_text",
     "create_telegram_application",
+    "format_accumulator_message",
+    "format_history_message",
+    "format_stats_message",
+    "format_welcome_message",
     "list_command_names",
     "parse_slip_number_argument",
     "run_telegram_application",
