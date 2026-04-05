@@ -15,6 +15,7 @@ from src.telegram.bot import (
     create_telegram_application,
     run_telegram_application,
 )
+from src.telegram.broadcast import broadcast_daily, send_to_user
 from src.telegram.commands import (
     build_bot_commands,
     build_help_text,
@@ -36,6 +37,7 @@ __all__ = [
     "build_bot_commands",
     "build_dispatcher",
     "build_help_text",
+    "broadcast_daily",
     "create_telegram_application",
     "format_accumulator_message",
     "format_history_message",
@@ -44,5 +46,6 @@ __all__ = [
     "list_command_names",
     "parse_slip_number_argument",
     "run_telegram_application",
+    "send_to_user",
     "telegram_commands_router",
 ]
