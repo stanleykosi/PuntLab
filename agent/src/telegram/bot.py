@@ -17,6 +17,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 
 from src.config import get_settings
+from src.telegram.admin import build_admin_router
 from src.telegram.commands import build_bot_commands, telegram_commands_router
 
 
@@ -69,11 +70,17 @@ def build_bot(*, token: str | None = None) -> Bot:
     )
 
 
-def build_dispatcher(*, command_router: Router | None = None) -> Dispatcher:
+def build_dispatcher(
+    *,
+    command_router: Router | None = None,
+    admin_router: Router | None = None,
+) -> Dispatcher:
     """Create the canonical dispatcher with command handlers and hooks.
 
     Inputs:
         command_router: Optional command router override used by tests or
+            custom runtime wiring.
+        admin_router: Optional admin router override used by tests or
             custom runtime wiring.
 
     Outputs:
@@ -82,6 +89,7 @@ def build_dispatcher(*, command_router: Router | None = None) -> Dispatcher:
 
     dispatcher = Dispatcher()
     dispatcher.include_router(command_router or telegram_commands_router)
+    dispatcher.include_router(admin_router or build_admin_router())
     register_lifecycle_hooks(dispatcher)
     return dispatcher
 
@@ -124,12 +132,14 @@ def create_telegram_application(
     *,
     token: str | None = None,
     command_router: Router | None = None,
+    admin_router: Router | None = None,
 ) -> TelegramApplication:
     """Create the immutable Telegram application bundle.
 
     Inputs:
         token: Optional explicit bot token override.
         command_router: Optional router override for tests or custom wiring.
+        admin_router: Optional admin router override for tests or custom wiring.
 
     Outputs:
         Built `TelegramApplication` containing bot and dispatcher instances.
@@ -137,7 +147,10 @@ def create_telegram_application(
 
     return TelegramApplication(
         bot=build_bot(token=token),
-        dispatcher=build_dispatcher(command_router=command_router),
+        dispatcher=build_dispatcher(
+            command_router=command_router,
+            admin_router=admin_router,
+        ),
     )
 
 

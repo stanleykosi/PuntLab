@@ -22,7 +22,7 @@ def test_build_bot_commands_includes_all_expected_commands() -> None:
 
     commands = build_bot_commands()
     assert [command.command for command in commands] == list(list_command_names())
-    assert len(commands) == 7
+    assert len(commands) == 8
 
 
 def test_build_help_text_includes_usage_lines_for_all_commands() -> None:

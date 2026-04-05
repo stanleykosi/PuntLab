@@ -30,6 +30,7 @@ _COMMAND_SPECS: tuple[tuple[str, str], ...] = (
     ("history", "View recent recommendation history"),
     ("stats", "View PuntLab performance statistics"),
     ("subscribe", "View subscription plans and upgrade options"),
+    ("admin", "Open admin controls (admin-only)"),
     ("help", "Show usage instructions"),
 )
 
