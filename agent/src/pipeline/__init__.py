@@ -7,5 +7,12 @@ Dependencies: imported by runtime code as orchestration features are added.
 """
 
 from src.pipeline.state import ApprovalStatus, PipelineStage, PipelineState
+from src.pipeline.router import ApprovalRoute, approval_router
 
-__all__ = ["ApprovalStatus", "PipelineStage", "PipelineState"]
+__all__ = [
+    "ApprovalRoute",
+    "ApprovalStatus",
+    "PipelineStage",
+    "PipelineState",
+    "approval_router",
+]
