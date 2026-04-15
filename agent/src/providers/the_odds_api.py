@@ -395,24 +395,40 @@ class TheOddsAPIProvider(DataProvider):
                     "event.bookmakers[].markets[].outcomes",
                 )
                 for outcome_payload in outcomes:
-                    normalized_rows.append(
-                        self._normalize_outcome(
-                            event_id=event_id,
-                            sport_key=sport_key,
-                            sport_title=sport_title,
-                            home_team=home_team,
-                            away_team=away_team,
-                            commence_time=commence_time,
-                            bookmaker_name=bookmaker_name,
-                            bookmaker_key=bookmaker_key,
-                            market_key=market_key,
-                            last_updated=last_updated,
-                            outcome_payload=self._require_mapping(
-                                outcome_payload,
-                                "event.bookmakers[].markets[].outcomes[]",
-                            ),
-                        )
+                    typed_outcome = self._require_mapping(
+                        outcome_payload,
+                        "event.bookmakers[].markets[].outcomes[]",
                     )
+                    try:
+                        normalized_rows.append(
+                            self._normalize_outcome(
+                                event_id=event_id,
+                                sport_key=sport_key,
+                                sport_title=sport_title,
+                                home_team=home_team,
+                                away_team=away_team,
+                                commence_time=commence_time,
+                                bookmaker_name=bookmaker_name,
+                                bookmaker_key=bookmaker_key,
+                                market_key=market_key,
+                                last_updated=last_updated,
+                                outcome_payload=typed_outcome,
+                            )
+                        )
+                    except ProviderError as exc:
+                        # Upstream feeds occasionally include malformed outcome
+                        # payloads for one market while the rest of the event
+                        # is valid. Preserve the healthy rows instead of
+                        # dropping the entire odds batch for one bad outcome.
+                        logger.warning(
+                            "Skipping malformed The Odds API outcome for event=%s "
+                            "bookmaker=%s market=%s: %s",
+                            event_id,
+                            bookmaker_name,
+                            market_key,
+                            exc,
+                        )
+                        continue
 
         return normalized_rows
 
@@ -769,13 +785,60 @@ class TheOddsAPIProvider(DataProvider):
     def _coerce_decimal_odds(self, value: object, *, field_name: str) -> float:
         """Coerce one provider odds value into a finite decimal float."""
 
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith(("+", "-")):
+                try:
+                    american_value = float(stripped)
+                except ValueError:
+                    # Fall through to canonical numeric validation below.
+                    american_value = None
+                if american_value is not None and abs(american_value) >= 100:
+                    return self._convert_american_to_decimal(
+                        american_value,
+                        field_name=field_name,
+                    )
+
         odds_value = self._coerce_float(value, field_name=field_name)
-        if odds_value <= 1.0:
+        if odds_value > 1.0:
+            return odds_value
+
+        if abs(odds_value) >= 100:
+            return self._convert_american_to_decimal(
+                odds_value,
+                field_name=field_name,
+            )
+
+        raise ProviderError(
+            self.provider_name,
+            f"{field_name} must be a decimal odds value greater than 1.0.",
+        )
+
+    def _convert_american_to_decimal(self, value: float, *, field_name: str) -> float:
+        """Convert one American odds value into decimal format.
+
+        Some sportsbooks may return American prices even when decimal was
+        requested. Converting keeps the ingestion path resilient and avoids
+        dropping full events due to mixed odds formats.
+        """
+
+        if value == 0:
             raise ProviderError(
                 self.provider_name,
-                f"{field_name} must be a decimal odds value greater than 1.0.",
+                f"{field_name} must not be zero.",
             )
-        return odds_value
+
+        decimal = (
+            1.0 + (value / 100.0)
+            if value > 0
+            else 1.0 + (100.0 / abs(value))
+        )
+        if decimal <= 1.0:
+            raise ProviderError(
+                self.provider_name,
+                f"{field_name} could not be converted to valid decimal odds.",
+            )
+        return decimal
 
     def _coerce_optional_float(self, value: object, *, field_name: str) -> float | None:
         """Parse an optional numeric field into a finite float."""

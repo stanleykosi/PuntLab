@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import cached_property, lru_cache
+from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -116,12 +117,34 @@ class LLMProviderConfig(BaseModel):
     openai_api_key: str | None
     anthropic_api_key: str | None
     openrouter_api_key: str | None
-    primary_provider: str = "openai"
-    secondary_provider: str = "anthropic"
-    fallback_provider: str = "openrouter"
-    primary_model: str = "gpt-4o"
-    secondary_model: str = "claude-sonnet-4-20250514"
-    fallback_model: str = "meta-llama/llama-3-70b-instruct"
+    primary_provider: str = "openrouter"
+    secondary_provider: str = "openai"
+    fallback_provider: str = "anthropic"
+    primary_model: str = "qwen/qwen3.6-plus:free"
+    secondary_model: str = "gpt-4o"
+    fallback_model: str = "claude-sonnet-4-20250514"
+
+    @field_validator("primary_provider", "secondary_provider", "fallback_provider")
+    @classmethod
+    def validate_provider_name(cls, value: str) -> str:
+        """Normalize and validate provider slot names."""
+
+        normalized = value.strip().lower()
+        if normalized not in {"openai", "anthropic", "openrouter"}:
+            raise ValueError(
+                "LLM provider slots must be one of: openai, anthropic, openrouter."
+            )
+        return normalized
+
+    @field_validator("primary_model", "secondary_model", "fallback_model")
+    @classmethod
+    def validate_model_name(cls, value: str) -> str:
+        """Reject blank model names in provider slot configuration."""
+
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("LLM model names must not be blank.")
+        return normalized
 
 
 class DataProviderConfig(BaseModel):
@@ -428,6 +451,8 @@ DEFAULT_PIPELINE_START_HOUR = 7
 DEFAULT_PUBLISH_HOUR = 10
 SUPPORTED_MARKET_TYPES = tuple(MarketType)
 SUPPORTED_COMPETITIONS = _build_supported_competitions()
+AGENT_ROOT_DIRECTORY = Path(__file__).resolve().parents[1]
+DEFAULT_ENV_FILE_PATH = AGENT_ROOT_DIRECTORY / ".env"
 
 
 class Settings(BaseSettings):
@@ -442,7 +467,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(DEFAULT_ENV_FILE_PATH),
         env_file_encoding="utf-8",
         env_ignore_empty=True,
         extra="ignore",
@@ -474,6 +499,18 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    llm_primary_provider: str = Field(default="openrouter", alias="LLM_PRIMARY_PROVIDER")
+    llm_secondary_provider: str = Field(default="openai", alias="LLM_SECONDARY_PROVIDER")
+    llm_fallback_provider: str = Field(default="anthropic", alias="LLM_FALLBACK_PROVIDER")
+    llm_primary_model: str = Field(
+        default="qwen/qwen3.6-plus:free",
+        alias="LLM_PRIMARY_MODEL",
+    )
+    llm_secondary_model: str = Field(default="gpt-4o", alias="LLM_SECONDARY_MODEL")
+    llm_fallback_model: str = Field(
+        default="claude-sonnet-4-20250514",
+        alias="LLM_FALLBACK_MODEL",
+    )
 
     api_football_key: str | None = Field(default=None, alias="API_FOOTBALL_KEY")
     football_data_api_key: str | None = Field(default=None, alias="FOOTBALL_DATA_API_KEY")
@@ -618,6 +655,12 @@ class Settings(BaseSettings):
             openai_api_key=self.openai_api_key,
             anthropic_api_key=self.anthropic_api_key,
             openrouter_api_key=self.openrouter_api_key,
+            primary_provider=self.llm_primary_provider,
+            secondary_provider=self.llm_secondary_provider,
+            fallback_provider=self.llm_fallback_provider,
+            primary_model=self.llm_primary_model,
+            secondary_model=self.llm_secondary_model,
+            fallback_model=self.llm_fallback_model,
         )
 
     @cached_property

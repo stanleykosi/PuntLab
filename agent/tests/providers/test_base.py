@@ -9,6 +9,7 @@ stub compatible with `src.cache.client.RedisClient`.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from datetime import datetime
 
@@ -17,6 +18,7 @@ import pytest
 from src.cache.client import RedisClient
 from src.config import WAT_TIMEZONE
 from src.providers.base import (
+    CachedHTTPResponse,
     DataProvider,
     RateLimitedClient,
     RateLimitExhausted,
@@ -277,5 +279,92 @@ async def test_data_provider_fetch_builds_absolute_urls_and_merges_headers() -> 
     assert captured_headers["authorization"] == "Bearer secret-token"
     assert captured_headers["x-request-id"] == "req-123"
     assert await cache.get_rate_count("example-provider", for_date="2026-04-03") == 1
+
+    await client.aclose()
+
+
+def test_cached_http_response_replay_drops_incompatible_encoding_headers() -> None:
+    """Cached replay should not preserve compression headers for decoded bytes."""
+
+    cached_response = CachedHTTPResponse(
+        method="GET",
+        url="https://provider.test/fixtures",
+        status_code=200,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            "Content-Length": "999",
+        },
+        content_base64=base64.b64encode(b'{"ok":true}').decode("ascii"),
+    )
+
+    replayed = cached_response.to_response()
+
+    assert replayed.json() == {"ok": True}
+    assert replayed.headers["content-type"] == "application/json"
+    assert "content-encoding" not in replayed.headers
+    assert replayed.headers["content-length"] == "11"
+
+
+@pytest.mark.asyncio
+async def test_request_discards_unreadable_cached_payload_and_refetches_network() -> None:
+    """Unreadable cached payloads should be bypassed and replaced from network."""
+
+    redis_stub = FakeAsyncRedis()
+    cache = RedisClient(redis_client=redis_stub)
+    network_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(200, json={"fresh": True}, request=request)
+
+    client = RateLimitedClient(
+        cache,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        clock=lambda: datetime(2026, 4, 3, 7, 0, tzinfo=WAT_TIMEZONE),
+    )
+    cache_key = client._build_response_cache_key(
+        provider="api-football",
+        method="GET",
+        url="https://provider.test/fixtures",
+        kwargs={"params": {"date": "2026-04-03"}},
+        headers={},
+        cache_vary_by_headers=(),
+    )
+    await cache.set(
+        cache_key,
+        CachedHTTPResponse(
+            method="GET",
+            url="https://provider.test/fixtures",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content_base64="%%%invalid-base64%%%",
+        ),
+        ttl_seconds=300,
+    )
+
+    first_response = await client.request(
+        "api-football",
+        "GET",
+        "https://provider.test/fixtures",
+        rate_limit_policy=RateLimitPolicy(limit=5, window_seconds=86_400),
+        cache_ttl_seconds=300,
+        params={"date": "2026-04-03"},
+    )
+    second_response = await client.request(
+        "api-football",
+        "GET",
+        "https://provider.test/fixtures",
+        rate_limit_policy=RateLimitPolicy(limit=5, window_seconds=86_400),
+        cache_ttl_seconds=300,
+        params={"date": "2026-04-03"},
+    )
+
+    assert network_calls == 1
+    assert first_response.extensions["from_cache"] is False
+    assert first_response.json() == {"fresh": True}
+    assert second_response.extensions["from_cache"] is True
+    assert second_response.json() == {"fresh": True}
 
     await client.aclose()

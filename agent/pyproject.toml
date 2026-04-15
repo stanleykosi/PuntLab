@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 puntlab-agent = "src.main:run"
+puntlab-agent-quick-run = "src.pipeline.quick_run:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

@@ -13,6 +13,7 @@ validated state exchange between LangGraph nodes.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, timedelta
@@ -37,6 +38,24 @@ MAX_ARTICLE_AGE_DAYS = 7
 MIN_RELEVANCE_THRESHOLD = 0.20
 NEUTRAL_CONTEXT_SCORE = 0.5
 FALLBACK_SOURCE_LABEL = "PuntLab fallback"
+_RESEARCH_LLM_FAILURE_PATTERN = re.compile(
+    r"^Research LLM analysis failed for (?P<fixture>.+?): (?P<reason>.+)$"
+)
+_TAVILY_RESEARCH_FAILURE_PATTERN = re.compile(
+    r"^Tavily research fetch failed for (?P<fixture>.+?): (?P<reason>.+)$"
+)
+_FIXTURE_IDENTIFIER_PATTERN = re.compile(
+    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    flags=re.IGNORECASE,
+)
+_REQUEST_ID_PATTERN = re.compile(
+    r"\brequest(?:[-_ ]?id)?\s*[:=]\s*[a-z0-9._-]+\b",
+    flags=re.IGNORECASE,
+)
+_UUID_PATTERN = re.compile(
+    r"\b[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +146,10 @@ async def research_node(
     return {
         "current_stage": PipelineStage.SCORING,
         "match_contexts": match_contexts,
-        "errors": _merge_diagnostics(validated_state.errors, diagnostics),
+        "errors": _merge_diagnostics(
+            validated_state.errors,
+            _summarize_research_diagnostics(diagnostics),
+        ),
     }
 
 
@@ -195,12 +217,9 @@ async def _research_fixture(
     )
 
     try:
-        structured_llm = llm.with_structured_output(MatchContext)
-        raw_result = await structured_llm.ainvoke(prompt_messages)
-        context = (
-            raw_result
-            if isinstance(raw_result, MatchContext)
-            else MatchContext.model_validate(raw_result)
+        context = await _invoke_structured_match_context(
+            llm=llm,
+            prompt_messages=prompt_messages,
         )
     except Exception as exc:
         diagnostics.append(
@@ -222,6 +241,190 @@ async def _research_fixture(
         )
 
     return FixtureResearchResult(context=context, diagnostics=tuple(diagnostics))
+
+
+async def _invoke_structured_match_context(
+    *,
+    llm: BaseChatModel,
+    prompt_messages: Sequence[Any],
+) -> MatchContext:
+    """Invoke the research LLM with schema enforcement and a targeted retry.
+
+    Inputs:
+        llm: Configured chat model resolved for the research task.
+        prompt_messages: Prompt message sequence produced by the canonical
+            research prompt template.
+
+    Outputs:
+        A validated `MatchContext` object.
+
+    Raises:
+        Exception: Propagates provider or parsing errors when both the default
+            and JSON-mode structured output paths fail.
+    """
+
+    if _is_openrouter_model(llm):
+        return await _invoke_openrouter_structured_match_context(
+            llm=llm,
+            prompt_messages=prompt_messages,
+        )
+
+    primary_runner = llm.with_structured_output(MatchContext)
+    try:
+        raw_result = await primary_runner.ainvoke(prompt_messages)
+    except Exception as exc:
+        if not _should_retry_structured_output_with_json_mode(exc):
+            raise
+        json_mode_runner = _build_json_mode_structured_runner(llm)
+        if json_mode_runner is None:
+            raise
+        raw_result = await json_mode_runner.ainvoke(prompt_messages)
+
+    return (
+        raw_result
+        if isinstance(raw_result, MatchContext)
+        else MatchContext.model_validate(raw_result)
+    )
+
+
+def _build_json_mode_structured_runner(llm: BaseChatModel) -> Any | None:
+    """Attempt to build a JSON-mode structured-output runner.
+
+    Inputs:
+        llm: Configured chat model resolved for the research task.
+
+    Outputs:
+        A structured-output runner configured for JSON mode when the provider
+        implementation supports that strategy; otherwise `None`.
+    """
+
+    try:
+        return llm.with_structured_output(MatchContext, method="json_mode")
+    except TypeError:
+        return None
+
+
+def _build_json_schema_structured_runner(llm: BaseChatModel) -> Any | None:
+    """Attempt to build a JSON-schema structured-output runner.
+
+    Inputs:
+        llm: Configured chat model resolved for the research task.
+
+    Outputs:
+        A structured-output runner configured for JSON schema mode when the
+        provider implementation supports that strategy; otherwise `None`.
+    """
+
+    try:
+        return llm.with_structured_output(MatchContext, method="json_schema")
+    except TypeError:
+        return None
+
+
+def _should_retry_structured_output_with_json_mode(error: Exception) -> bool:
+    """Return whether structured output should retry using JSON mode.
+
+    Inputs:
+        error: Exception raised by the default structured-output call path.
+
+    Outputs:
+        `True` when the error matches known tool-calling parser instability
+        signatures seen with some OpenRouter models.
+    """
+
+    message = " ".join(str(error).split()).casefold()
+    return (
+        "nonetype" in message and "iterable" in message
+    ) or "tool_calls" in message
+
+
+def _should_retry_openrouter_structured_output(error: Exception) -> bool:
+    """Return whether OpenRouter structured output should fallback to JSON mode.
+
+    Inputs:
+        error: Exception raised while invoking JSON-schema structured output.
+
+    Outputs:
+        `True` when the error indicates either unsupported strict-schema mode
+        or known structured-output parser instability.
+    """
+
+    message = " ".join(str(error).split()).casefold()
+    return any(
+        token in message
+        for token in (
+            "response_format",
+            "json_schema",
+            "structured output",
+            "does not support",
+            "doesn't support",
+            "unsupported",
+            "nonetype",
+            "tool_calls",
+            "schema validation",
+        )
+    )
+
+
+def _is_openrouter_model(llm: BaseChatModel) -> bool:
+    """Return whether the resolved chat model is configured for OpenRouter."""
+
+    base_url = str(
+        getattr(llm, "openai_api_base", None) or getattr(llm, "base_url", "") or ""
+    )
+    return "openrouter.ai" in base_url.casefold()
+
+
+async def _invoke_openrouter_structured_match_context(
+    *,
+    llm: BaseChatModel,
+    prompt_messages: Sequence[Any],
+) -> MatchContext:
+    """Invoke OpenRouter using documented structured-output request modes.
+
+    Inputs:
+        llm: Configured chat model resolved for the research task.
+        prompt_messages: Prompt message sequence produced by the canonical
+            research prompt template.
+
+    Outputs:
+        A validated `MatchContext` object.
+
+    Raises:
+        Exception: Propagates provider or parsing errors when both JSON schema
+            and JSON mode structured output paths fail.
+    """
+
+    json_schema_runner = _build_json_schema_structured_runner(llm)
+    json_schema_error: Exception | None = None
+    if json_schema_runner is not None:
+        try:
+            json_schema_result = await json_schema_runner.ainvoke(prompt_messages)
+            return (
+                json_schema_result
+                if isinstance(json_schema_result, MatchContext)
+                else MatchContext.model_validate(json_schema_result)
+            )
+        except Exception as exc:
+            json_schema_error = exc
+            if not _should_retry_openrouter_structured_output(exc):
+                raise
+
+    json_mode_runner = _build_json_mode_structured_runner(llm)
+    if json_mode_runner is None:
+        if json_schema_error is not None:
+            raise json_schema_error
+        raise RuntimeError(
+            "OpenRouter structured-output runner is unavailable: "
+            "neither json_schema nor json_mode is supported by this model adapter."
+        )
+
+    json_mode_result = await json_mode_runner.ainvoke(prompt_messages)
+    return (
+        json_mode_result
+        if isinstance(json_mode_result, MatchContext)
+        else MatchContext.model_validate(json_mode_result)
+    )
 
 
 def _build_optional_tavily_provider() -> tuple[
@@ -311,13 +514,25 @@ def _select_relevant_articles(
 def _score_article_relevance(fixture: NormalizedFixture, article: NewsArticle) -> float:
     """Estimate how closely one article maps to the target fixture."""
 
-    score = 0.0
     fixture_ref = fixture.get_fixture_ref()
+    if article.fixture_ref is not None and article.fixture_ref != fixture_ref:
+        # Articles that are already fixture-linked must never bleed into other
+        # fixtures, even if provider-level relevance metadata is high.
+        return 0.0
+
+    score = 0.0
     if article.fixture_ref == fixture_ref:
         score += 0.60
-    if article.sport == fixture.sport:
+
+    sport_matches = article.sport == fixture.sport
+    if sport_matches:
         score += 0.10
-    if article.competition and article.competition.casefold() == fixture.competition.casefold():
+
+    competition_matches = bool(
+        article.competition
+        and article.competition.casefold() == fixture.competition.casefold()
+    )
+    if competition_matches:
         score += 0.15
 
     matched_teams = {
@@ -328,7 +543,11 @@ def _score_article_relevance(fixture: NormalizedFixture, article: NewsArticle) -
     score += min(0.30, len(matched_teams) * 0.15)
 
     if article.relevance_score is not None:
-        score = max(score, article.relevance_score)
+        # Only trust provider-level relevance when the article is not already
+        # fixture-linked and has at least one local anchor signal.
+        has_local_anchor = bool(matched_teams) or competition_matches or sport_matches
+        if article.fixture_ref is None and has_local_anchor:
+            score = max(score, article.relevance_score)
 
     return max(0.0, min(1.0, score))
 
@@ -529,6 +748,77 @@ def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str
     return merged
 
 
+def _summarize_research_diagnostics(diagnostics: Sequence[str]) -> tuple[str, ...]:
+    """Compress repetitive fixture-level research diagnostics.
+
+    Inputs:
+        diagnostics: Ordered diagnostic rows produced while researching a slate.
+
+    Outputs:
+        A tuple where repeated fixture-specific failures are grouped into one
+        concise message per root cause while one-off diagnostics are preserved.
+    """
+
+    summarized: list[str] = []
+    llm_failures_by_reason: dict[str, list[str]] = {}
+    llm_reason_examples: dict[str, str] = {}
+    tavily_failures_by_reason: dict[str, list[str]] = {}
+    tavily_reason_examples: dict[str, str] = {}
+
+    for diagnostic in diagnostics:
+        llm_match = _RESEARCH_LLM_FAILURE_PATTERN.match(diagnostic)
+        if llm_match is not None:
+            raw_reason = llm_match.group("reason").strip()
+            reason = _normalize_research_failure_reason(raw_reason)
+            fixture_ref = llm_match.group("fixture").strip()
+            llm_failures_by_reason.setdefault(reason, []).append(fixture_ref)
+            llm_reason_examples.setdefault(reason, raw_reason)
+            continue
+
+        tavily_match = _TAVILY_RESEARCH_FAILURE_PATTERN.match(diagnostic)
+        if tavily_match is not None:
+            raw_reason = tavily_match.group("reason").strip()
+            reason = _normalize_research_failure_reason(raw_reason)
+            fixture_ref = tavily_match.group("fixture").strip()
+            tavily_failures_by_reason.setdefault(reason, []).append(fixture_ref)
+            tavily_reason_examples.setdefault(reason, raw_reason)
+            continue
+
+        summarized.append(diagnostic)
+
+    for reason, fixture_refs in llm_failures_by_reason.items():
+        if len(fixture_refs) == 1:
+            reason_for_single = llm_reason_examples.get(reason, reason)
+            summarized.append(
+                f"Research LLM analysis failed for {fixture_refs[0]}: {reason_for_single}"
+            )
+            continue
+        normalized_reason = reason.rstrip(".")
+        sample_refs = ", ".join(fixture_refs[:3])
+        summarized.append(
+            "Research LLM analysis failed for "
+            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
+            f"Fallback context was used. Sample fixtures: {sample_refs}."
+        )
+
+    for reason, fixture_refs in tavily_failures_by_reason.items():
+        if len(fixture_refs) == 1:
+            reason_for_single = tavily_reason_examples.get(reason, reason)
+            summarized.append(
+                f"Tavily research fetch failed for {fixture_refs[0]}: {reason_for_single}"
+            )
+            continue
+        normalized_reason = reason.rstrip(".")
+        sample_refs = ", ".join(fixture_refs[:3])
+        summarized.append(
+            "Tavily research fetch failed for "
+            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
+            f"Sample fixtures: {sample_refs}."
+        )
+
+    return tuple(summarized)
+
+
 def _truncate(value: str, limit: int) -> str:
     """Clamp long strings to keep prompt and fallback text compact."""
 
@@ -536,6 +826,51 @@ def _truncate(value: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3].rstrip() + "..."
+
+
+def _normalize_research_failure_reason(reason: str) -> str:
+    """Normalize volatile provider error text into a stable root-cause string.
+
+    Inputs:
+        reason: Raw exception text captured during fixture-level research.
+
+    Outputs:
+        A compact reason string with request-specific identifiers removed so
+        repeated failures aggregate into one operator-visible root cause.
+    """
+
+    normalized = " ".join(reason.split())
+    lowered = normalized.casefold()
+
+    if "rate limit" in lowered or "http 429" in lowered or "status code: 429" in lowered:
+        return "LLM provider rate limit reached."
+    if "timed out" in lowered or "timeout" in lowered:
+        return "LLM request timed out."
+    if (
+        "network is unreachable" in lowered
+        or "name resolution" in lowered
+        or "connection error" in lowered
+        or "connection refused" in lowered
+    ):
+        return "LLM provider connection failed."
+    if (
+        "authentication" in lowered
+        or "unauthorized" in lowered
+        or "http 401" in lowered
+        or "invalid api key" in lowered
+    ):
+        return "LLM provider authentication failed."
+    if (
+        "json" in lowered
+        or "validation" in lowered
+        or "field required" in lowered
+    ):
+        return "LLM output schema validation failed."
+
+    normalized = _REQUEST_ID_PATTERN.sub("request_id=<redacted>", normalized)
+    normalized = _UUID_PATTERN.sub("<uuid>", normalized)
+    normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)
+    return normalized
 
 
 __all__ = ["DEFAULT_RESEARCH_BATCH_SIZE", "research_node"]

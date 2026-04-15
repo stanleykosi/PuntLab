@@ -84,10 +84,9 @@ LEG_RATIONALE_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             (
-                "You write betting-selection rationales for PuntLab. Return plain text only, "
-                "not JSON. Keep the response to 1-2 sentences, under 45 words, and focus on "
-                "the strongest evidence-backed edge. Mention a caveat only if it materially "
-                "changes confidence."
+                "You write betting-selection rationales for PuntLab. Keep the rationale to "
+                "1-2 sentences, under 45 words, and focus on the strongest evidence-backed "
+                "edge. Mention a caveat only if it materially changes confidence."
             ),
         ),
         (
@@ -108,9 +107,9 @@ ACCUMULATOR_RATIONALE_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             (
-                "You write accumulator summaries for PuntLab. Return plain text only, not "
-                "JSON. Keep the response to 2-3 sentences, under 70 words, and explain why "
-                "the legs fit together without hype or guaranteed language."
+                "You write accumulator summaries for PuntLab. Keep the summary to 2-3 "
+                "sentences, under 70 words, and explain why the legs fit together without "
+                "hype or guaranteed language."
             ),
         ),
         (

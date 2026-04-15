@@ -347,3 +347,120 @@ async def test_scoring_node_records_fixture_failures_and_continues() -> None:
             "TeamStats records to the fixture."
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_scoring_node_groups_repeated_failures_by_reason() -> None:
+    """Repeated scoring failures with the same cause should be summarized once."""
+
+    failed_fixture_one = build_fixture(
+        sportradar_id="sr:match:7101",
+        home_team="Tottenham",
+        away_team="Liverpool",
+    )
+    failed_fixture_two = build_fixture(
+        sportradar_id="sr:match:7102",
+        home_team="Newcastle",
+        away_team="Brentford",
+    )
+
+    result = await scoring_node(
+        PipelineState(
+            run_id="run-2026-04-04-grouped",
+            run_date=date(2026, 4, 4),
+            started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+            current_stage=PipelineStage.SCORING,
+            fixtures=[failed_fixture_one, failed_fixture_two],
+            odds_data=[],
+            team_stats=[
+                build_team_stats(
+                    team_id="arsenal",
+                    team_name="Arsenal",
+                    wins=7,
+                    draws=2,
+                    losses=1,
+                    goals_for=20,
+                    goals_against=10,
+                    home_wins=4,
+                    away_wins=3,
+                    form="WWWDDWWLWW",
+                    avg_goals_scored=2.0,
+                    avg_goals_conceded=1.0,
+                    xg_diff=0.6,
+                ),
+            ],
+            match_contexts=[],
+            errors=[],
+        ),
+        engine=ScoringEngine(),
+    )
+
+    assert result["match_scores"] == []
+    assert result["errors"] == [
+        (
+            "Scoring failed for 2 fixtures due to: calculate_match_score could not "
+            "match any TeamStats records to the fixture. "
+            "Sample fixtures: sr:match:7101, sr:match:7102."
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scoring_node_groups_fixture_specific_reasons_after_normalization() -> None:
+    """Fixture IDs embedded in scoring exceptions should still aggregate by cause."""
+
+    class FailingEngine:
+        """Test-only scoring engine that raises fixture-specific errors."""
+
+        def calculate_match_score(
+            self,
+            fixture: NormalizedFixture,
+            team_stats: list[TeamStats],
+            odds_data: list[NormalizedOdds],
+            *,
+            context: MatchContext | None = None,
+            injuries: list[InjuryData] | None = None,
+            h2h_data: object | None = None,
+        ) -> object:
+            """Raise one deterministic fixture-specific failure message."""
+
+            del team_stats, odds_data, context, injuries, h2h_data
+            raise ValueError(
+                "No finished historical meetings are available for fixture "
+                f"{fixture.get_fixture_ref()}."
+            )
+
+    failed_fixture_one = build_fixture(
+        sportradar_id="sr:match:7301",
+        home_team="Tottenham",
+        away_team="Liverpool",
+    )
+    failed_fixture_two = build_fixture(
+        sportradar_id="sr:match:7302",
+        home_team="Newcastle",
+        away_team="Brentford",
+    )
+
+    result = await scoring_node(
+        PipelineState(
+            run_id="run-2026-04-04-grouped-normalized",
+            run_date=date(2026, 4, 4),
+            started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+            current_stage=PipelineStage.SCORING,
+            fixtures=[failed_fixture_one, failed_fixture_two],
+            odds_data=[],
+            team_stats=[],
+            match_contexts=[],
+            errors=[],
+        ),
+        engine=FailingEngine(),  # type: ignore[arg-type]
+    )
+
+    assert result["match_scores"] == []
+    assert result["errors"] == [
+        (
+            "Scoring failed for 2 fixtures due to: No finished historical meetings are "
+            "available for fixture <fixture>. "
+            "Sample fixtures: sr:match:7301, sr:match:7302."
+        )
+    ]

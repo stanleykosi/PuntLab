@@ -46,35 +46,53 @@ _NBA_DEFAULT_SEASON_START_MONTH: Final[int] = 10
 _FIXTURE_MATCH_TIME_WINDOW: Final[timedelta] = timedelta(hours=18)
 _MATCH_NEWS_LOOKBACK_DAYS: Final[int] = 7
 _SOCCER_ODDS_MARKETS: Final[tuple[str, ...]] = (
+    # Sport-level Odds API endpoints reliably support these core pre-match
+    # market families across most soccer competitions on free plans.
+    # Additional niche markets (for example BTTS/double_chance/correct_score)
+    # are fetched opportunistically from fallback providers when available.
     "h2h",
     "totals",
     "spreads",
-    "btts",
-    "draw_no_bet",
-    "double_chance",
-    "correct_score",
 )
 _NBA_ODDS_MARKETS: Final[tuple[str, ...]] = ("h2h", "spreads", "totals")
 _TEAM_STOP_WORDS: Final[frozenset[str]] = frozenset(
     {
+        "ac",
         "afc",
+        "as",
         "athletic",
         "basketball",
         "bc",
         "bk",
+        "ca",
+        "cd",
         "cf",
         "city",
         "club",
         "county",
+        "de",
+        "e",
         "fc",
         "football",
+        "gd",
+        "olympique",
         "sc",
+        "sd",
         "sporting",
         "the",
         "town",
+        "ud",
         "united",
+        "us",
     }
 )
+_TEAM_TOKEN_EXPANSIONS: Final[dict[str, tuple[str, ...]]] = {
+    # Common abbreviation expansions that appear across basketball and soccer
+    # feeds and would otherwise fail strict token overlap checks.
+    "la": ("los", "angeles"),
+    "ny": ("new", "york"),
+    "st": ("saint",),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,17 +966,23 @@ class ProviderOrchestrator:
                     exc,
                 )
             else:
-                self._api_fixture_cache[(competition.key, run_date, season)] = tuple(api_fixtures)
-                return tuple(api_fixtures)
+                canonical_fixtures = tuple(
+                    self._apply_competition_identity(fixture, competition)
+                    for fixture in api_fixtures
+                )
+                self._api_fixture_cache[(competition.key, run_date, season)] = canonical_fixtures
+                return canonical_fixtures
 
         if self._football_data is not None and route.football_data_code is not None:
             try:
-                return tuple(
-                    await self._football_data.fetch_fixtures_by_date(
+                football_data_fixtures = await self._football_data.fetch_fixtures_by_date(
                         run_date=run_date,
                         competition_code=route.football_data_code,
                         season=season,
                     )
+                return tuple(
+                    self._apply_competition_identity(fixture, competition)
+                    for fixture in football_data_fixtures
                 )
             except ProviderError as exc:
                 logger.warning(
@@ -968,6 +992,26 @@ class ProviderOrchestrator:
                     exc,
                 )
         return ()
+
+    @staticmethod
+    def _apply_competition_identity(
+        fixture: NormalizedFixture,
+        competition: CompetitionConfig,
+    ) -> NormalizedFixture:
+        """Stamp canonical competition identity onto provider fixture rows.
+
+        Football providers may expose alternate competition labels (for example
+        `Primera Division` instead of `La Liga`). Normalizing to the configured
+        competition identity keeps downstream routing deterministic.
+        """
+
+        return fixture.model_copy(
+            update={
+                "competition": competition.name,
+                "country": competition.country,
+                "league": competition.slug,
+            }
+        )
 
     async def _fetch_the_odds_rows(
         self,
@@ -1220,11 +1264,16 @@ class ProviderOrchestrator:
             home_team = self._string_metadata(sample_row, "home_team")
             away_team = self._string_metadata(sample_row, "away_team")
             commence_time = self._datetime_metadata(sample_row, "commence_time")
+            sport_key = self._string_metadata(sample_row, "sport_key")
+            candidate_fixtures = self._filter_fixtures_by_sport_key(
+                fixtures=fixtures,
+                sport_key=sport_key,
+            )
             matched_fixture = self._find_best_fixture_match(
                 reference_home_team=home_team,
                 reference_away_team=away_team,
                 reference_kickoff=commence_time,
-                candidates=fixtures,
+                candidates=candidate_fixtures,
                 sport=self._infer_fixture_sport(group_rows, fixtures),
                 competition=None,
                 country=None,
@@ -1246,6 +1295,42 @@ class ProviderOrchestrator:
             )
         )
         return tuple(matched_rows), unmatched_fixture_refs
+
+    def _filter_fixtures_by_sport_key(
+        self,
+        *,
+        fixtures: tuple[NormalizedFixture, ...],
+        sport_key: str | None,
+    ) -> tuple[NormalizedFixture, ...]:
+        """Restrict fixture candidates to the same The Odds sport-key route.
+
+        Inputs:
+            fixtures: Current fixture candidates still unresolved by prior odds
+                rows.
+            sport_key: The Odds API sport key attached to one event group.
+
+        Outputs:
+            Fixtures that share the same configured `the_odds_sport_key`. Falls
+            back to the original candidate list when no scoped fixtures exist.
+        """
+
+        if sport_key is None:
+            return fixtures
+
+        normalized_sport_key = sport_key.strip().lower()
+        if not normalized_sport_key:
+            return fixtures
+
+        scoped_fixtures = tuple(
+            fixture
+            for fixture in fixtures
+            if (
+                (route := self._route_for_fixture(fixture)) is not None
+                and route.the_odds_sport_key is not None
+                and route.the_odds_sport_key.lower() == normalized_sport_key
+            )
+        )
+        return scoped_fixtures if scoped_fixtures else fixtures
 
     def _match_provider_fixtures_to_canonical(
         self,
@@ -1302,7 +1387,11 @@ class ProviderOrchestrator:
                 continue
             home_score = self._team_similarity(reference_home_team, candidate.home_team)
             away_score = self._team_similarity(reference_away_team, candidate.away_team)
-            if home_score < 0.72 or away_score < 0.72:
+            if not self._passes_team_match_gate(
+                home_score=home_score,
+                away_score=away_score,
+                time_penalty=time_penalty,
+            ):
                 continue
 
             score = (home_score + away_score) - time_penalty
@@ -1320,6 +1409,38 @@ class ProviderOrchestrator:
                 best_fixture = candidate
 
         return best_fixture
+
+    @staticmethod
+    def _passes_team_match_gate(
+        *,
+        home_score: float,
+        away_score: float,
+        time_penalty: float,
+    ) -> bool:
+        """Return whether one candidate pair is strong enough to accept.
+
+        Inputs:
+            home_score: Similarity score between reference and candidate home
+                teams.
+            away_score: Similarity score between reference and candidate away
+                teams.
+            time_penalty: Normalized kickoff mismatch penalty where `0.0` is an
+                exact time match and `1.0` is the maximum accepted distance.
+
+        Outputs:
+            `True` when the pair has strong bilateral similarity or one very
+            strong team-name match plus a near-identical kickoff timestamp.
+        """
+
+        if home_score >= 0.72 and away_score >= 0.72:
+            return True
+        if time_penalty <= 0.05 and home_score >= 0.60 and away_score >= 0.60:
+            return True
+        if time_penalty <= 0.08 and max(home_score, away_score) >= 0.82 and min(
+            home_score, away_score
+        ) >= 0.45:
+            return True
+        return False
 
     def _build_competition_identity_index(
         self,
@@ -1564,7 +1685,12 @@ class ProviderOrchestrator:
             for token in cls._normalize_phrase(value).split()
             if token not in _TEAM_STOP_WORDS
         }
-        return tokens
+        expanded_tokens = set(tokens)
+        for token in tokens:
+            expansion = _TEAM_TOKEN_EXPANSIONS.get(token)
+            if expansion is not None:
+                expanded_tokens.update(expansion)
+        return expanded_tokens
 
     @staticmethod
     def _normalize_phrase(value: str) -> str:

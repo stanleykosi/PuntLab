@@ -349,6 +349,52 @@ def build_api_fallback_row() -> NormalizedOdds:
     )
 
 
+def build_nba_the_odds_row() -> NormalizedOdds:
+    """Create one NBA odds row that uses a long-form away-team alias."""
+
+    return NormalizedOdds(
+        fixture_ref="the-odds-api:event-nba-1",
+        market=MarketType.MONEYLINE,
+        selection="away",
+        odds=2.02,
+        provider="Pinnacle",
+        provider_market_name="h2h",
+        provider_selection_name="Los Angeles Clippers",
+        sportybet_available=False,
+        raw_metadata={
+            "event_id": "event-nba-1",
+            "sport_key": "basketball_nba",
+            "home_team": "Sacramento Kings",
+            "away_team": "Los Angeles Clippers",
+            "commence_time": "2026-04-06T01:10:00+00:00",
+        },
+        last_updated=datetime(2026, 4, 5, 20, 0, tzinfo=UTC),
+    )
+
+
+def build_serie_a_alias_row() -> NormalizedOdds:
+    """Create one Serie A row with a short-form team label alias."""
+
+    return NormalizedOdds(
+        fixture_ref="the-odds-api:event-sa-1",
+        market=MarketType.MATCH_RESULT,
+        selection="home",
+        odds=1.95,
+        provider="Pinnacle",
+        provider_market_name="h2h",
+        provider_selection_name="Inter Milan",
+        sportybet_available=False,
+        raw_metadata={
+            "event_id": "event-sa-1",
+            "sport_key": "soccer_italy_serie_a",
+            "home_team": "Inter Milan",
+            "away_team": "AS Roma",
+            "commence_time": "2026-04-05T18:45:00+00:00",
+        },
+        last_updated=datetime(2026, 4, 5, 18, 0, tzinfo=UTC),
+    )
+
+
 def build_news_article(*, fixture: NormalizedFixture, url: str, source: str) -> NewsArticle:
     """Create a canonical news article tied to one fixture."""
 
@@ -417,10 +463,6 @@ async def test_fetch_odds_matches_the_odds_rows_and_builds_catalog() -> None:
                 "h2h",
                 "totals",
                 "spreads",
-                "btts",
-                "draw_no_bet",
-                "double_chance",
-                "correct_score",
             ),
         )
     ]
@@ -446,6 +488,68 @@ async def test_fetch_odds_falls_back_to_api_football_and_reports_sportybet_gap()
     assert result.catalog.scoreable_rows()[0].fixture_ref == "sr:match:9001"
     assert api_provider.odds_requests == [501]
     assert not result.warnings
+
+
+@pytest.mark.asyncio
+async def test_fetch_odds_matches_nba_rows_when_team_names_use_common_aliases() -> None:
+    """NBA odds matching should handle `LA` vs `Los Angeles` team aliases."""
+
+    fixture = NormalizedFixture(
+        sportradar_id=None,
+        home_team="Sacramento Kings",
+        away_team="LA Clippers",
+        competition="NBA",
+        sport=SportName.BASKETBALL,
+        kickoff=datetime(2026, 4, 6, 1, 0, tzinfo=UTC),
+        source_provider="balldontlie",
+        source_id="18447959",
+        country="United States",
+        home_team_id="30",
+        away_team_id="13",
+    )
+    the_odds_api = StubTheOddsAPIProvider(
+        odds_by_sport={"basketball_nba": [build_nba_the_odds_row()]}
+    )
+    orchestrator = ProviderOrchestrator(the_odds_api=the_odds_api)
+
+    result = await orchestrator.fetch_odds(fixtures=(fixture,))
+
+    assert result.unmatched_fixture_refs == ()
+    assert result.providers_attempted == ("the-odds-api",)
+    assert len(result.catalog.all_rows()) == 1
+    assert result.catalog.all_rows()[0].fixture_ref == "balldontlie:18447959"
+    assert result.catalog.scoreable_rows()[0].market == MarketType.MONEYLINE
+
+
+@pytest.mark.asyncio
+async def test_fetch_odds_matches_soccer_rows_with_short_form_team_aliases() -> None:
+    """Soccer matching should accept short-form aliases with exact kickoff match."""
+
+    fixture = NormalizedFixture(
+        sportradar_id=None,
+        home_team="FC Internazionale Milano",
+        away_team="AS Roma",
+        competition="Serie A",
+        sport=SportName.SOCCER,
+        kickoff=datetime(2026, 4, 5, 18, 45, tzinfo=UTC),
+        source_provider="football-data",
+        source_id="537116",
+        country="Italy",
+        home_team_id="108",
+        away_team_id="100",
+    )
+    the_odds_api = StubTheOddsAPIProvider(
+        odds_by_sport={"soccer_italy_serie_a": [build_serie_a_alias_row()]}
+    )
+    orchestrator = ProviderOrchestrator(the_odds_api=the_odds_api)
+
+    result = await orchestrator.fetch_odds(fixtures=(fixture,))
+
+    assert result.unmatched_fixture_refs == ()
+    assert result.providers_attempted == ("the-odds-api",)
+    assert len(result.catalog.all_rows()) == 1
+    assert result.catalog.all_rows()[0].fixture_ref == "football-data:537116"
+    assert result.catalog.scoreable_rows()[0].market == MarketType.MATCH_RESULT
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,12 @@ def test_settings_parses_env_aliases_and_groups(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("LOG_LEVEL", "debug")
     monkeypatch.setenv("PIPELINE_START_HOUR", "7")
     monkeypatch.setenv("PUBLISH_HOUR", "10")
+    monkeypatch.setenv("LLM_PRIMARY_PROVIDER", "openrouter")
+    monkeypatch.setenv("LLM_SECONDARY_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "anthropic")
+    monkeypatch.setenv("LLM_PRIMARY_MODEL", "qwen/qwen3.6-plus:free")
+    monkeypatch.setenv("LLM_SECONDARY_MODEL", "gpt-4o")
+    monkeypatch.setenv("LLM_FALLBACK_MODEL", "claude-sonnet-4-20250514")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.setenv("API_FOOTBALL_KEY", "rapidapi-key")
     monkeypatch.setenv("SUPABASE_URL", "https://puntlab.supabase.co")
@@ -45,6 +51,12 @@ def test_settings_parses_env_aliases_and_groups(monkeypatch: pytest.MonkeyPatch)
     assert settings.app.pipeline_start_hour == DEFAULT_PIPELINE_START_HOUR
     assert settings.app.publish_hour == DEFAULT_PUBLISH_HOUR
     assert settings.app.timezone_name == WAT_TIMEZONE_NAME
+    assert settings.llm.primary_provider == "openrouter"
+    assert settings.llm.secondary_provider == "openai"
+    assert settings.llm.fallback_provider == "anthropic"
+    assert settings.llm.primary_model == "qwen/qwen3.6-plus:free"
+    assert settings.llm.secondary_model == "gpt-4o"
+    assert settings.llm.fallback_model == "claude-sonnet-4-20250514"
     assert settings.llm.openai_api_key == "sk-openai"
     assert settings.data_providers.api_football_key == "rapidapi-key"
     assert settings.database.supabase_url == "https://puntlab.supabase.co"

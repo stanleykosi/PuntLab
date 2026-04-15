@@ -350,3 +350,108 @@ async def _async_noop() -> None:
     """Return immediately for async callback injection in tests."""
 
     return None
+
+
+@pytest.mark.asyncio
+async def test_delivery_node_retries_transient_send_errors() -> None:
+    """Transient Telegram transport errors should be retried before failing."""
+
+    slip = build_explained_accumulator(slip_number=5, confidence=0.84)
+    user = FakeUser(id=uuid4(), telegram_id=60606)
+    attempts = {"count": 0}
+
+    @asynccontextmanager
+    async def session_provider() -> RecordingSession:
+        """Provide a disposable recording session."""
+
+        yield RecordingSession()
+
+    async def user_fetcher(
+        _session: RecordingSession,
+        tier: SubscriptionTier,
+    ) -> tuple[FakeUser, ...]:
+        """Return one free-tier user and no users for other tiers."""
+
+        if tier is SubscriptionTier.FREE:
+            return (user,)
+        return ()
+
+    async def sender(_chat_id: int, _message: str) -> None:
+        """Fail twice with transient errors, then succeed."""
+
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise OSError("Network is unreachable")
+
+    result = await delivery_node(
+        PipelineState(
+            run_id="run-2026-04-13-retry",
+            run_date=date(2026, 4, 13),
+            started_at=datetime(2026, 4, 13, 8, 0, tzinfo=UTC),
+            current_stage=PipelineStage.DELIVERY,
+            approval_status=ApprovalStatus.APPROVED,
+            accumulators=[slip],
+            explained_accumulators=[slip],
+        ),
+        session_provider=session_provider,
+        user_fetcher=user_fetcher,  # type: ignore[arg-type]
+        log_writer=lambda _session, _logs: _async_noop(),  # type: ignore[arg-type]
+        telegram_sender=sender,
+    )
+
+    assert attempts["count"] == 3
+    assert len(result["delivery_results"]) == 1
+    assert result["delivery_results"][0].status is DeliveryStatus.SENT
+
+
+@pytest.mark.asyncio
+async def test_delivery_node_admin_fallback_when_db_delivery_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB transport failures should trigger admin Telegram fallback delivery."""
+
+    slip = build_explained_accumulator(slip_number=6, confidence=0.86)
+    sent_messages: list[tuple[int, str]] = []
+
+    @asynccontextmanager
+    async def failing_session_provider() -> RecordingSession:
+        """Raise a DB connectivity error before yielding a session."""
+
+        raise OSError("[Errno 101] Network is unreachable")
+        yield RecordingSession()  # pragma: no cover
+
+    async def sender(chat_id: int, message: str) -> None:
+        """Capture admin fallback sends."""
+
+        sent_messages.append((chat_id, message))
+
+    class _FakeSettings:
+        """Minimal settings shell exposing admin Telegram IDs."""
+
+        class telegram:
+            admin_telegram_ids = (777001,)
+
+    monkeypatch.setattr("src.pipeline.nodes.delivery.get_settings", lambda: _FakeSettings())
+
+    result = await delivery_node(
+        PipelineState(
+            run_id="run-2026-04-13-admin-fallback",
+            run_date=date(2026, 4, 13),
+            started_at=datetime(2026, 4, 13, 8, 5, tzinfo=UTC),
+            current_stage=PipelineStage.DELIVERY,
+            approval_status=ApprovalStatus.APPROVED,
+            accumulators=[slip],
+            explained_accumulators=[slip],
+        ),
+        session_provider=failing_session_provider,
+        telegram_sender=sender,
+    )
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0][0] == 777001
+    assert len(result["delivery_results"]) == 1
+    assert result["delivery_results"][0].status is DeliveryStatus.SENT
+    assert any(
+        "using TELEGRAM_ADMIN_IDS fallback recipients" in message
+        for message in result["errors"]
+    )

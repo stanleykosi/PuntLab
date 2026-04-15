@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -114,6 +114,9 @@ class CachedHTTPResponse(BaseModel):
         description="Serializable response headers preserved for cached reads.",
     )
     content_base64: str = Field(description="Base64-encoded raw response body bytes.")
+    _REPLAY_UNSAFE_HEADERS: ClassVar[frozenset[str]] = frozenset(
+        {"content-encoding", "transfer-encoding", "content-length"}
+    )
 
     @field_validator("method", "url", "content_base64")
     @classmethod
@@ -135,7 +138,7 @@ class CachedHTTPResponse(BaseModel):
             method=request.method.upper(),
             url=str(request.url),
             status_code=response.status_code,
-            headers={key: value for key, value in response.headers.items()},
+            headers=cls._sanitize_replay_headers(response.headers),
             content_base64=base64.b64encode(content_bytes).decode("ascii"),
         )
 
@@ -143,14 +146,40 @@ class CachedHTTPResponse(BaseModel):
         """Reconstruct a cached payload into an `httpx.Response` object."""
 
         request = httpx.Request(self.method, self.url)
+        # Defensive normalization guards against legacy cache entries that were
+        # persisted before header sanitization was introduced.
+        replay_headers = self._sanitize_replay_headers(self.headers)
         response = httpx.Response(
             self.status_code,
-            headers=self.headers,
+            headers=replay_headers,
             content=base64.b64decode(self.content_base64.encode("ascii")),
             request=request,
         )
         response.extensions["from_cache"] = True
         return response
+
+    @classmethod
+    def _sanitize_replay_headers(cls, headers: Mapping[str, str]) -> dict[str, str]:
+        """Drop headers that can make cached body replay invalid.
+
+        Inputs:
+            headers: Upstream response headers captured during network fetch.
+
+        Outputs:
+            A replay-safe header mapping without transport/compression metadata
+            that can conflict with cached body bytes during reconstruction.
+        """
+
+        sanitized_headers: dict[str, str] = {}
+        for key, value in headers.items():
+            normalized_key = key.strip()
+            normalized_value = value.strip()
+            if not normalized_key or not normalized_value:
+                continue
+            if normalized_key.lower() in cls._REPLAY_UNSAFE_HEADERS:
+                continue
+            sanitized_headers[normalized_key] = normalized_value
+        return sanitized_headers
 
 
 class ProviderError(RuntimeError):
@@ -301,7 +330,15 @@ class RateLimitedClient:
                     normalized_provider,
                     normalized_url,
                 )
-                return cached_entry.to_response()
+                try:
+                    return cached_entry.to_response()
+                except (ValueError, httpx.DecodingError) as exc:
+                    logger.warning(
+                        "Discarding unreadable cached response for provider=%s url=%s: %s",
+                        normalized_provider,
+                        normalized_url,
+                        exc,
+                    )
 
         last_error: ProviderError | None = None
         for attempt in range(1, resolved_retry.max_attempts + 1):

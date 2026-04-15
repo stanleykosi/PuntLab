@@ -131,7 +131,7 @@ async def test_get_llm_falls_back_to_anthropic_when_openai_key_is_missing(
 async def test_get_llm_uses_openrouter_with_openai_compatible_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The fallback provider should target OpenRouter's OpenAI-compatible endpoint."""
+    """The OpenRouter provider should use the OpenAI-compatible endpoint."""
 
     install_fake_model_factories(monkeypatch)
     settings = build_settings(openrouter_api_key="sk-or")
@@ -140,7 +140,7 @@ async def test_get_llm_uses_openrouter_with_openai_compatible_base_url(
 
     assert isinstance(llm, FakeChatModel)
     assert llm.provider_label == "openai"
-    assert llm.kwargs["model"] == "meta-llama/llama-3-70b-instruct"
+    assert llm.kwargs["model"] == settings.llm.primary_model
     assert llm.kwargs["base_url"] == providers.OPENROUTER_BASE_URL
     assert llm.kwargs["default_headers"] == {"X-Title": "puntlab-agent"}
     assert llm.kwargs["max_tokens"] == 150
@@ -157,7 +157,7 @@ async def test_get_llm_raises_clear_error_when_no_provider_credentials_exist(
 
     with pytest.raises(
         AllProvidersFailedError,
-        match="Attempted providers: openai, anthropic, openrouter",
+        match="Attempted providers: openrouter, openai, anthropic",
     ):
         await get_llm("leg_rationale", settings=settings)
 

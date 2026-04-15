@@ -12,6 +12,7 @@ stages.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -20,6 +21,14 @@ from src.schemas.analysis import MatchContext, MatchScore
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.stats import InjuryData, TeamStats
 from src.scoring import ScoringEngine
+
+_SCORING_FAILURE_PATTERN = re.compile(
+    r"^Scoring failed for (?P<fixture>.+?): (?P<reason>.+)$"
+)
+_FIXTURE_IDENTIFIER_PATTERN = re.compile(
+    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    flags=re.IGNORECASE,
+)
 
 
 async def scoring_node(
@@ -73,7 +82,10 @@ async def scoring_node(
     return {
         "current_stage": PipelineStage.RANKING,
         "match_scores": match_scores,
-        "errors": _merge_diagnostics(validated_state.errors, diagnostics),
+        "errors": _merge_diagnostics(
+            validated_state.errors,
+            _summarize_scoring_diagnostics(diagnostics),
+        ),
     }
 
 
@@ -172,6 +184,66 @@ def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str
         merged_errors.append(diagnostic)
 
     return merged_errors
+
+
+def _summarize_scoring_diagnostics(diagnostics: Sequence[str]) -> tuple[str, ...]:
+    """Compress repetitive fixture-level scoring failures by shared reason.
+
+    Inputs:
+        diagnostics: Ordered scoring diagnostics collected per fixture.
+
+    Outputs:
+        A tuple where repeated fixture-specific failures are grouped into one
+        message per root cause, while one-off diagnostics remain unchanged.
+    """
+
+    summarized: list[str] = []
+    failures_by_reason: dict[str, list[str]] = {}
+    reason_examples: dict[str, str] = {}
+
+    for diagnostic in diagnostics:
+        match = _SCORING_FAILURE_PATTERN.match(diagnostic)
+        if match is None:
+            summarized.append(diagnostic)
+            continue
+        raw_reason = match.group("reason").strip()
+        reason = _normalize_scoring_failure_reason(raw_reason)
+        fixture_ref = match.group("fixture").strip()
+        failures_by_reason.setdefault(reason, []).append(fixture_ref)
+        reason_examples.setdefault(reason, raw_reason)
+
+    for reason, fixture_refs in failures_by_reason.items():
+        if len(fixture_refs) == 1:
+            reason_for_single = reason_examples.get(reason, reason)
+            summarized.append(
+                f"Scoring failed for {fixture_refs[0]}: {reason_for_single}"
+            )
+            continue
+        normalized_reason = reason.rstrip(".")
+        sample_refs = ", ".join(fixture_refs[:3])
+        summarized.append(
+            "Scoring failed for "
+            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
+            f"Sample fixtures: {sample_refs}."
+        )
+
+    return tuple(summarized)
+
+
+def _normalize_scoring_failure_reason(reason: str) -> str:
+    """Normalize variable fixture-specific fragments in scoring failures.
+
+    Inputs:
+        reason: Raw exception text raised while scoring one fixture.
+
+    Outputs:
+        A normalized root-cause string that keeps semantic detail while
+        removing fixture-specific identifiers that fragment aggregation.
+    """
+
+    normalized = " ".join(reason.split())
+    normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)
+    return normalized
 
 
 __all__ = ["scoring_node"]

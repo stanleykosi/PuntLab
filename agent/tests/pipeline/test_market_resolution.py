@@ -311,3 +311,161 @@ async def test_market_resolution_node_records_failures_and_missing_fixtures() ->
         resolved_fixture.get_fixture_ref(),
         failed_fixture.get_fixture_ref(),
     ]
+
+
+@pytest.mark.asyncio
+async def test_market_resolution_node_groups_repeated_failures_by_reason() -> None:
+    """Repeated fixture-level resolver failures should collapse into one summary."""
+
+    failed_fixture_one = build_fixture(
+        sportradar_id="sr:match:7201",
+        home_team="Milan",
+        away_team="Inter",
+        competition="Serie A",
+    )
+    failed_fixture_two = build_fixture(
+        sportradar_id="sr:match:7202",
+        home_team="Napoli",
+        away_team="Roma",
+        competition="Serie A",
+    )
+    resolver = StubMarketResolver(
+        resolved_by_fixture={},
+        errors_by_fixture={
+            failed_fixture_one.get_fixture_ref(): ProviderError(
+                "market-resolver",
+                "all resolver sources failed",
+            ),
+            failed_fixture_two.get_fixture_ref(): ProviderError(
+                "market-resolver",
+                "all resolver sources failed",
+            ),
+        },
+    )
+
+    result = await market_resolution_node(
+        PipelineState(
+            run_id="run-2026-04-05-grouped-resolution",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 8, 0, tzinfo=UTC),
+            current_stage=PipelineStage.MARKET_RESOLUTION,
+            fixtures=[failed_fixture_one, failed_fixture_two],
+            ranked_matches=[
+                build_ranked_match(fixture=failed_fixture_one, rank=1),
+                build_ranked_match(fixture=failed_fixture_two, rank=2),
+            ],
+        ),
+        resolver=resolver,  # type: ignore[arg-type]
+    )
+
+    assert result["resolved_markets"] == []
+    assert result["errors"] == [
+        (
+            "Market resolution failed for 2 fixtures due to: "
+            "[market-resolver] all resolver sources failed. "
+            "Sample fixtures: sr:match:7201, sr:match:7202."
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_market_resolution_node_skips_ranked_matches_without_recommendation() -> None:
+    """Ranked matches without a canonical recommendation should be skipped early."""
+
+    fixture = build_fixture(
+        sportradar_id="sr:match:7301",
+        home_team="Arsenal",
+        away_team="Chelsea",
+    )
+    resolver = StubMarketResolver(resolved_by_fixture={})
+    missing_recommendation = build_ranked_match(fixture=fixture, rank=1).model_copy(
+        update={
+            "recommended_market": None,
+            "recommended_selection": None,
+            "recommended_odds": None,
+        }
+    )
+
+    result = await market_resolution_node(
+        PipelineState(
+            run_id="run-2026-04-05-missing-recommendation",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
+            current_stage=PipelineStage.MARKET_RESOLUTION,
+            fixtures=[fixture],
+            ranked_matches=[missing_recommendation],
+        ),
+        resolver=resolver,  # type: ignore[arg-type]
+    )
+
+    assert result["resolved_markets"] == []
+    assert result["errors"] == [
+        (
+            "Market resolution skipped for sr:match:7301: "
+            "ranked match lacks a canonical recommended market and selection."
+        )
+    ]
+    assert resolver.resolve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_market_resolution_node_normalizes_verbose_external_odds_failures() -> None:
+    """Fixture-specific resolver detail should collapse into one grouped root cause."""
+
+    failed_fixture_one = build_fixture(
+        sportradar_id="sr:match:7401",
+        home_team="Milan",
+        away_team="Inter",
+        competition="Serie A",
+    )
+    failed_fixture_two = build_fixture(
+        sportradar_id="sr:match:7402",
+        home_team="Napoli",
+        away_team="Roma",
+        competition="Serie A",
+    )
+    resolver_error_detail = (
+        "Could not resolve a bookmaker market for fixture sr:match:placeholder "
+        "(Team A vs Team B). Recommended market: `match_result`. "
+        "Recommended selection: `home`. Diagnostics: SportyBet resolution was skipped because "
+        "fixture.sportradar_id is missing. | External odds fallback did not contain a compatible "
+        "canonical market for the fixture."
+    )
+    resolver = StubMarketResolver(
+        resolved_by_fixture={},
+        errors_by_fixture={
+            failed_fixture_one.get_fixture_ref(): ProviderError(
+                "market-resolver",
+                resolver_error_detail,
+            ),
+            failed_fixture_two.get_fixture_ref(): ProviderError(
+                "market-resolver",
+                resolver_error_detail.replace("sr:match:placeholder", "sr:match:other"),
+            ),
+        },
+    )
+
+    result = await market_resolution_node(
+        PipelineState(
+            run_id="run-2026-04-05-grouped-external-odds",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 9, 30, tzinfo=UTC),
+            current_stage=PipelineStage.MARKET_RESOLUTION,
+            fixtures=[failed_fixture_one, failed_fixture_two],
+            ranked_matches=[
+                build_ranked_match(fixture=failed_fixture_one, rank=1),
+                build_ranked_match(fixture=failed_fixture_two, rank=2),
+            ],
+        ),
+        resolver=resolver,  # type: ignore[arg-type]
+    )
+
+    assert result["resolved_markets"] == []
+    assert result["errors"] == [
+        (
+            "Market resolution failed for 2 fixtures due to: "
+            "[market-resolver] no compatible canonical odds were found for the recommended "
+            "market and selection. "
+            "Sample fixtures: sr:match:7401, sr:match:7402."
+        )
+    ]

@@ -48,17 +48,43 @@ class QueueStructuredLLM:
 class FakeLLM:
     """Minimal chat-model stub exposing `with_structured_output()`."""
 
-    def __init__(self, runner: QueueStructuredLLM) -> None:
+    def __init__(
+        self,
+        runner: QueueStructuredLLM,
+        *,
+        json_mode_runner: QueueStructuredLLM | None = None,
+        openai_api_base: str | None = None,
+        plain_result: object | None = None,
+    ) -> None:
         """Persist the structured-output runner used by this fake LLM."""
 
         self.runner = runner
+        self.json_mode_runner = json_mode_runner
         self.requested_schema: type[object] | None = None
+        self.requested_methods: list[str] = []
+        self.openai_api_base = openai_api_base
+        self.plain_result = plain_result
 
-    def with_structured_output(self, schema: type[object]) -> QueueStructuredLLM:
+    def with_structured_output(
+        self,
+        schema: type[object],
+        **kwargs: object,
+    ) -> QueueStructuredLLM:
         """Record the requested schema and return the queued runner."""
 
+        method = kwargs.get("method")
         self.requested_schema = schema
+        self.requested_methods.append(str(method) if method is not None else "default")
+        if method == "json_mode" and self.json_mode_runner is not None:
+            return self.json_mode_runner
         return self.runner
+
+    async def ainvoke(self, _prompt_value: object) -> object:
+        """Return plain output for OpenRouter text-mode parsing tests."""
+
+        if self.plain_result is None:
+            raise RuntimeError("FakeLLM.plain_result must be configured before ainvoke().")
+        return self.plain_result
 
 
 def build_leg(
@@ -230,3 +256,285 @@ async def test_explanation_node_falls_back_when_llm_setup_fails(
     assert len(result["errors"]) == 2
     assert "Unable to construct an LLM for task 'leg_rationale'" in result["errors"][0]
     assert "Unable to construct an LLM for task 'accumulator_rationale'" in result["errors"][1]
+
+
+@pytest.mark.asyncio
+async def test_explanation_node_emits_progress_updates_for_slips_and_legs() -> None:
+    """Explanation should emit structured progress callbacks throughout execution."""
+
+    leg_runner = QueueStructuredLLM(
+        [
+            LegRationale(
+                fixture_ref="sr:match:8101",
+                rationale="Arsenal's control profile remains stronger at home.",
+                key_risk=None,
+            ),
+            LegRationale(
+                fixture_ref="sr:match:8102",
+                rationale="Liverpool's tempo and chance volume stay favorable.",
+                key_risk=None,
+            ),
+        ]
+    )
+    accumulator_runner = QueueStructuredLLM(
+        [
+            AccumulatorRationale(
+                slip_number=1,
+                rationale="Both legs align with stable home-side confidence.",
+                shared_risk=None,
+            )
+        ]
+    )
+    updates: list[dict[str, object]] = []
+
+    result = await explanation_node(
+        PipelineState(
+            run_id="run-2026-04-05-progress",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 7, 55, tzinfo=UTC),
+            current_stage=PipelineStage.EXPLANATION,
+            accumulators=[build_accumulator()],
+        ),
+        leg_llm=FakeLLM(leg_runner),  # type: ignore[arg-type]
+        accumulator_llm=FakeLLM(accumulator_runner),  # type: ignore[arg-type]
+        progress_callback=lambda payload: updates.append(dict(payload)),
+    )
+
+    assert result["current_stage"] == PipelineStage.APPROVAL
+    assert updates[0]["event"] == "stage_started"
+    assert updates[-1]["event"] == "stage_completed"
+    assert any(update["event"] == "slip_started" for update in updates)
+    assert any(update["event"] == "leg_started" for update in updates)
+    assert any(update["event"] == "leg_completed" for update in updates)
+    assert any(update["event"] == "slip_rationale_started" for update in updates)
+    assert any(update["event"] == "slip_completed" for update in updates)
+
+
+@pytest.mark.asyncio
+async def test_explanation_node_normalizes_text_field_payloads() -> None:
+    """Non-canonical dict payloads with `text` should still validate cleanly."""
+
+    leg_runner = QueueStructuredLLM(
+        [
+            {"fixture_ref": "sr:match:8101", "text": "Arsenal are favored at home."},
+            {"fixture_ref": "sr:match:8102", "text": "Liverpool remain the stronger side."},
+        ]
+    )
+    accumulator_runner = QueueStructuredLLM(
+        [
+            {"slip_number": 1, "text": "Both legs align with stronger home profiles."}
+        ]
+    )
+
+    result = await explanation_node(
+        PipelineState(
+            run_id="run-2026-04-05-normalized-payload",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 8, 0, tzinfo=UTC),
+            current_stage=PipelineStage.EXPLANATION,
+            accumulators=[build_accumulator()],
+        ),
+        leg_llm=FakeLLM(leg_runner),  # type: ignore[arg-type]
+        accumulator_llm=FakeLLM(accumulator_runner),  # type: ignore[arg-type]
+    )
+
+    assert result["current_stage"] == PipelineStage.APPROVAL
+    assert result["errors"] == []
+    assert len(result["explained_accumulators"]) == 1
+    assert result["explained_accumulators"][0].legs[0].rationale.startswith(
+        "Arsenal are favored at home."
+    )
+
+
+@pytest.mark.asyncio
+async def test_explanation_node_disables_leg_llm_after_rate_limit() -> None:
+    """A 429 leg failure should disable remaining leg LLM calls in the stage."""
+
+    leg_runner = QueueStructuredLLM(
+        [
+            LegRationale(
+                fixture_ref="sr:match:8101",
+                rationale="Should not be consumed because first call rate limits.",
+                key_risk=None,
+            )
+        ]
+    )
+    leg_runner.error = RuntimeError("Error code: 429 - provider rate-limited")
+    accumulator_runner = QueueStructuredLLM(
+        [
+            AccumulatorRationale(
+                slip_number=1,
+                rationale="Fallback-friendly slip summary.",
+                shared_risk=None,
+            )
+        ]
+    )
+
+    result = await explanation_node(
+        PipelineState(
+            run_id="run-2026-04-05-rate-limit",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 8, 5, tzinfo=UTC),
+            current_stage=PipelineStage.EXPLANATION,
+            accumulators=[build_accumulator()],
+        ),
+        leg_llm=FakeLLM(leg_runner),  # type: ignore[arg-type]
+        accumulator_llm=FakeLLM(accumulator_runner),  # type: ignore[arg-type]
+    )
+
+    assert result["current_stage"] == PipelineStage.APPROVAL
+    assert any(
+        "Leg rationale LLM was disabled for the remaining slips due to upstream rate limiting."
+        in message
+        for message in result["errors"]
+    )
+    assert any(
+        "Leg explanation failed for" in message and "LLM provider rate limit reached."
+        in message
+        for message in result["errors"]
+    )
+    # First leg invoked the LLM, second leg fell back with the LLM disabled.
+    assert len(leg_runner.invocations) == 1
+
+
+@pytest.mark.asyncio
+async def test_explanation_node_uses_json_schema_mode_for_openrouter_models() -> None:
+    """OpenRouter explanation calls should prefer JSON-schema structured output."""
+
+    leg_runner = QueueStructuredLLM(
+        [
+            LegRationale(
+                fixture_ref="sr:match:8101",
+                rationale="Arsenal remain favorites.",
+                key_risk=None,
+            ),
+            LegRationale(
+                fixture_ref="sr:match:8102",
+                rationale="Liverpool hold the stronger profile.",
+                key_risk=None,
+            ),
+        ]
+    )
+    accumulator_runner = QueueStructuredLLM(
+        [
+            AccumulatorRationale(
+                slip_number=1,
+                rationale="Combined profile remains coherent.",
+                shared_risk=None,
+            )
+        ]
+    )
+    leg_llm = FakeLLM(
+        leg_runner,
+        openai_api_base="https://openrouter.ai/api/v1",
+    )
+    accumulator_llm = FakeLLM(
+        accumulator_runner,
+        openai_api_base="https://openrouter.ai/api/v1",
+    )
+
+    result = await explanation_node(
+        PipelineState(
+            run_id="run-2026-04-05-openrouter-text",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 8, 10, tzinfo=UTC),
+            current_stage=PipelineStage.EXPLANATION,
+            accumulators=[build_accumulator()],
+        ),
+        leg_llm=leg_llm,  # type: ignore[arg-type]
+        accumulator_llm=accumulator_llm,  # type: ignore[arg-type]
+    )
+
+    assert result["current_stage"] == PipelineStage.APPROVAL
+    assert result["errors"] == []
+    assert leg_llm.requested_methods == ["json_schema", "json_schema"]
+    assert accumulator_llm.requested_methods == ["json_schema"]
+    assert len(leg_runner.invocations) == 2
+    assert len(accumulator_runner.invocations) == 1
+
+
+@pytest.mark.asyncio
+async def test_explanation_node_falls_back_to_json_mode_when_openrouter_json_schema_fails() -> None:
+    """OpenRouter explanation should retry with JSON mode when schema mode is unsupported."""
+
+    json_schema_leg_runner = QueueStructuredLLM(
+        [
+            LegRationale(
+                fixture_ref="sr:match:8101",
+                rationale="unused",
+                key_risk=None,
+            )
+        ]
+    )
+    json_schema_leg_runner.error = RuntimeError(
+        "Model does not support response_format json_schema for this route."
+    )
+    json_mode_leg_runner = QueueStructuredLLM(
+        [
+            LegRationale(
+                fixture_ref="sr:match:8101",
+                rationale="Arsenal hold the stronger form edge at home.",
+                key_risk=None,
+            ),
+            LegRationale(
+                fixture_ref="sr:match:8102",
+                rationale="Liverpool still carry superior chance quality trends.",
+                key_risk=None,
+            ),
+        ]
+    )
+
+    json_schema_acc_runner = QueueStructuredLLM(
+        [
+            AccumulatorRationale(
+                slip_number=1,
+                rationale="unused",
+                shared_risk=None,
+            )
+        ]
+    )
+    json_schema_acc_runner.error = RuntimeError(
+        "Model does not support response_format json_schema for this route."
+    )
+    json_mode_acc_runner = QueueStructuredLLM(
+        [
+            AccumulatorRationale(
+                slip_number=1,
+                rationale="Both legs align around stronger home-side confidence signals.",
+                shared_risk=None,
+            )
+        ]
+    )
+
+    leg_llm = FakeLLM(
+        json_schema_leg_runner,
+        json_mode_runner=json_mode_leg_runner,
+        openai_api_base="https://openrouter.ai/api/v1",
+    )
+    accumulator_llm = FakeLLM(
+        json_schema_acc_runner,
+        json_mode_runner=json_mode_acc_runner,
+        openai_api_base="https://openrouter.ai/api/v1",
+    )
+
+    result = await explanation_node(
+        PipelineState(
+            run_id="run-2026-04-05-openrouter-json-mode-fallback",
+            run_date=date(2026, 4, 5),
+            started_at=datetime(2026, 4, 5, 8, 15, tzinfo=UTC),
+            current_stage=PipelineStage.EXPLANATION,
+            accumulators=[build_accumulator()],
+        ),
+        leg_llm=leg_llm,  # type: ignore[arg-type]
+        accumulator_llm=accumulator_llm,  # type: ignore[arg-type]
+    )
+
+    assert result["current_stage"] == PipelineStage.APPROVAL
+    assert result["errors"] == []
+    assert leg_llm.requested_methods == [
+        "json_schema",
+        "json_mode",
+        "json_schema",
+        "json_mode",
+    ]
+    assert accumulator_llm.requested_methods == ["json_schema", "json_mode"]

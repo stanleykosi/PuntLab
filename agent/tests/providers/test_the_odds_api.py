@@ -343,3 +343,53 @@ async def test_fetch_event_odds_rejects_regions_and_bookmakers_together() -> Non
         )
 
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_odds_converts_american_prices_and_skips_malformed_rows() -> None:
+    """Odds normalization should tolerate mixed price formats per event."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "event-777",
+                    "sport_key": "soccer_epl",
+                    "sport_title": "Premier League",
+                    "commence_time": "2026-04-03T19:45:00Z",
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "bookmakers": [
+                        {
+                            "key": "pinnacle",
+                            "title": "Pinnacle",
+                            "last_update": "2026-04-03T11:30:00Z",
+                            "markets": [
+                                {
+                                    "key": "h2h",
+                                    "outcomes": [
+                                        {"name": "Arsenal", "price": "+110"},
+                                        {"name": "Draw", "price": "-105"},
+                                        {"name": "Chelsea", "price": 2.30},
+                                        {"name": "Broken", "price": "bad-value"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            request=request,
+        )
+
+    provider, client = build_provider(handler)
+    rows = await provider.fetch_odds(sport_key="soccer_epl", markets=("h2h",))
+
+    assert len(rows) == 3
+    home_row = next(row for row in rows if row.selection == "home")
+    draw_row = next(row for row in rows if row.selection == "draw")
+    assert home_row.odds == pytest.approx(2.10, abs=0.001)
+    assert draw_row.odds == pytest.approx(1.952, abs=0.001)
+
+    await client.aclose()

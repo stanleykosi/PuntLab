@@ -12,6 +12,7 @@ Telegram message delivery.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
@@ -37,6 +38,8 @@ type DeliveryLogWriter = Callable[
     [AsyncSession, list[DeliveryLogCreate]], Awaitable[None]
 ]
 type TelegramSender = Callable[[int, str], Awaitable[None]]
+_DELIVERY_SEND_MAX_ATTEMPTS = 3
+_DELIVERY_SEND_RETRY_BASE_SECONDS = 1.0
 
 
 async def delivery_node(
@@ -93,39 +96,51 @@ async def delivery_node(
     users_processed = 0
 
     async with _telegram_sender_context(telegram_sender) as send_message:
-        async with session_provider() as session:
-            try:
-                for tier in (
-                    SubscriptionTier.FREE,
-                    SubscriptionTier.PLUS,
-                    SubscriptionTier.ELITE,
-                ):
-                    tier_users = await resolved_user_fetcher(session, tier)
-                    if not tier_users:
-                        diagnostics.append(
-                            f"No active users found for tier `{tier.value}` during delivery."
-                        )
-                        continue
+        try:
+            async with session_provider() as session:
+                try:
+                    for tier in (
+                        SubscriptionTier.FREE,
+                        SubscriptionTier.PLUS,
+                        SubscriptionTier.ELITE,
+                    ):
+                        tier_users = await resolved_user_fetcher(session, tier)
+                        if not tier_users:
+                            diagnostics.append(
+                                f"No active users found for tier `{tier.value}` during delivery."
+                            )
+                            continue
 
-                    tier_slips = tier_distribution[tier]
-                    for user in tier_users:
-                        users_processed += 1
-                        user_results, user_logs = await _deliver_to_user(
-                            user=user,
-                            tier=tier,
-                            slips=tier_slips,
-                            send_message=send_message,
-                        )
-                        delivery_results.extend(user_results)
-                        delivery_logs.extend(user_logs)
+                        tier_slips = tier_distribution[tier]
+                        for user in tier_users:
+                            users_processed += 1
+                            user_results, user_logs = await _deliver_to_user(
+                                user=user,
+                                tier=tier,
+                                slips=tier_slips,
+                                send_message=send_message,
+                            )
+                            delivery_results.extend(user_results)
+                            delivery_logs.extend(user_logs)
 
-                if delivery_logs:
-                    await resolved_log_writer(session, delivery_logs)
+                    if delivery_logs:
+                        await resolved_log_writer(session, delivery_logs)
 
-                await session.commit()
-            except Exception:
-                await session.rollback()
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+        except Exception as exc:
+            admin_fallback = await _deliver_to_admin_fallback(
+                slips=approved_explained,
+                send_message=send_message,
+                cause=exc,
+            )
+            if admin_fallback is None:
                 raise
+            fallback_results, fallback_diagnostics = admin_fallback
+            delivery_results.extend(fallback_results)
+            diagnostics.extend(fallback_diagnostics)
 
     if users_processed == 0:
         diagnostics.append("No active users were processed during delivery.")
@@ -218,7 +233,11 @@ async def _deliver_to_user(
             continue
 
         try:
-            await send_message(user.telegram_id, _format_accumulator_message(slip))
+            await _send_with_retries(
+                send_message=send_message,
+                chat_id=user.telegram_id,
+                message=_format_accumulator_message(slip),
+            )
         except Exception as exc:
             error_message = f"Telegram send failed: {exc}"
             attempt_time = datetime.now(UTC)
@@ -269,6 +288,115 @@ async def _deliver_to_user(
         )
 
     return user_results, user_logs
+
+
+async def _deliver_to_admin_fallback(
+    *,
+    slips: Sequence[AccumulatorSlip],
+    send_message: TelegramSender,
+    cause: Exception,
+) -> tuple[list[DeliveryResult], tuple[str, ...]] | None:
+    """Deliver directly to configured admin IDs when DB delivery cannot run.
+
+    Inputs:
+        slips: Approved slips ready for delivery.
+        send_message: Telegram sender callback used for message delivery.
+        cause: Original exception that prevented DB-backed delivery.
+
+    Outputs:
+        `None` when no admin fallback recipients are configured, otherwise a
+        tuple of fallback delivery results and diagnostics.
+    """
+
+    admin_ids = get_settings().telegram.admin_telegram_ids
+    if not admin_ids:
+        return None
+
+    diagnostics: list[str] = [
+        "Database-backed delivery failed; using TELEGRAM_ADMIN_IDS fallback recipients. "
+        f"Root cause: {cause}"
+    ]
+    fallback_results: list[DeliveryResult] = []
+
+    for admin_id in admin_ids:
+        for slip in slips:
+            try:
+                await _send_with_retries(
+                    send_message=send_message,
+                    chat_id=admin_id,
+                    message=_format_accumulator_message(slip),
+                )
+            except Exception as exc:
+                fallback_results.append(
+                    DeliveryResult(
+                        accumulator_id=slip.slip_id,
+                        user_id=None,
+                        channel=DeliveryChannel.TELEGRAM,
+                        status=DeliveryStatus.FAILED,
+                        subscription_tier=SubscriptionTier.ELITE,
+                        recipient=str(admin_id),
+                        error_message=f"Telegram send failed: {exc}",
+                        delivered_at=datetime.now(UTC),
+                    )
+                )
+                continue
+
+            fallback_results.append(
+                DeliveryResult(
+                    accumulator_id=slip.slip_id,
+                    user_id=None,
+                    channel=DeliveryChannel.TELEGRAM,
+                    status=DeliveryStatus.SENT,
+                    subscription_tier=SubscriptionTier.ELITE,
+                    recipient=str(admin_id),
+                    delivered_at=datetime.now(UTC),
+                )
+            )
+
+    if not any(result.status is DeliveryStatus.SENT for result in fallback_results):
+        diagnostics.append(
+            "Admin fallback delivery attempted but all Telegram sends failed."
+        )
+
+    return fallback_results, tuple(diagnostics)
+
+
+async def _send_with_retries(
+    *,
+    send_message: TelegramSender,
+    chat_id: int,
+    message: str,
+) -> None:
+    """Send one Telegram message with retry handling for transient errors."""
+
+    for attempt in range(_DELIVERY_SEND_MAX_ATTEMPTS):
+        try:
+            await send_message(chat_id, message)
+            return
+        except Exception as exc:
+            is_last_attempt = attempt == (_DELIVERY_SEND_MAX_ATTEMPTS - 1)
+            if is_last_attempt or not _is_transient_delivery_error(exc):
+                raise
+            await asyncio.sleep(_DELIVERY_SEND_RETRY_BASE_SECONDS * (2**attempt))
+
+
+def _is_transient_delivery_error(error: Exception) -> bool:
+    """Return whether one delivery error appears transient and retryable."""
+
+    if isinstance(error, (TimeoutError, OSError)):
+        return True
+    message = " ".join(str(error).split()).casefold()
+    return any(
+        token in message
+        for token in (
+            "network is unreachable",
+            "temporarily unavailable",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+        )
+    )
 
 
 def _format_accumulator_message(slip: AccumulatorSlip) -> str:

@@ -1,10 +1,10 @@
 """Canonical multi-provider LLM configuration for PuntLab.
 
-Purpose: centralize task-aware model settings, provider selection, and
+Purpose: centralize task-aware model settings, provider selection order, and
 Langfuse callback wiring for every LangChain-backed LLM call.
-Scope: OpenAI primary selection, Anthropic secondary fallback, OpenRouter
-fallback via the OpenAI-compatible API, and fail-fast diagnostics when no
-provider can be constructed for a requested task.
+Scope: configurable OpenRouter/OpenAI/Anthropic provider fallbacks via
+LangChain adapters plus fail-fast diagnostics when no provider can be
+constructed for a requested task.
 Dependencies: `src.config` for validated credentials and model ordering,
 `langchain-openai`/`langchain-anthropic` for chat models, and `langfuse` for
 optional tracing callbacks.
