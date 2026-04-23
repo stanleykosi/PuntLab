@@ -30,9 +30,11 @@ NEWS_CONTEXT_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             (
                 "You are PuntLab's fixture news analyst. Use only the supplied evidence. "
-                "Never invent injuries, quotes, lineup news, or standings context. Score "
-                "conservatively on a 0-1 scale when evidence is thin. Keep key_narrative "
-                "under 200 characters and news_summary under 160 characters."
+                "Never invent injuries, quotes, lineup news, standings context, or market "
+                "options. Treat the supplied market menu as available betting inventory, not "
+                "proof of outcome likelihood. Score conservatively on a 0-1 scale when "
+                "evidence is thin. Keep key_narrative under 200 characters and news_summary "
+                "under 160 characters."
             ),
         ),
         (
@@ -43,11 +45,16 @@ NEWS_CONTEXT_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages(
                 "Competition context: {competition_context}\n"
                 "Kickoff context: {kickoff_context}\n"
                 "Known absences: {known_absences}\n"
+                "SportyBet fixture-page details:\n{fixture_details}\n"
+                "Available betting markets:\n{market_menu}\n"
                 "Relevant news bullets:\n{recent_news_bullets}\n"
                 "Source labels: {source_labels}\n\n"
                 "Assess morale, rivalry intensity, and pressure for both teams. Score "
                 "conservatively, ground every score in the supplied material, and lower "
-                "confidence if the news is weak or mixed."
+                "confidence if the news is weak or mixed. If one available market clearly "
+                "fits the evidence, return its exact market key, market label, selection, "
+                "odds, and line exactly as shown in the supplied market menu. Leave those "
+                "fields null when no betting angle is justified."
             ),
         ),
     ]
@@ -109,7 +116,7 @@ ACCUMULATOR_RATIONALE_PROMPT = ChatPromptTemplate.from_messages(
             (
                 "You write accumulator summaries for PuntLab. Keep the summary to 2-3 "
                 "sentences, under 70 words, and explain why the legs fit together without "
-                "hype or guaranteed language."
+                "hype or guaranteed language. Return plain text only."
             ),
         ),
         (

@@ -21,7 +21,17 @@ from src.providers.orchestrator import ProviderOrchestrator
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.news import NewsArticle
 from src.schemas.odds import NormalizedOdds
-from src.schemas.stats import InjuryData, InjuryType
+from src.schemas.stats import InjuryData, InjuryType, TeamStats
+from src.scrapers.sportybet_fixture_probe import build_fixture_page_url
+from src.scrapers.sportybet_fixture_stats import (
+    SportyBetFixtureStatsResult,
+    SportyBetFixtureStatsWidget,
+)
+from src.scrapers.sportybet_today import (
+    SportyBetTodayEvent,
+    SportyBetTodaySlate,
+    SportyBetTodaySport,
+)
 
 
 def build_soccer_fixture(
@@ -78,13 +88,10 @@ class StubAPIFootballProvider:
     fixtures_by_league: dict[tuple[int, date, int], list[NormalizedFixture]] = field(
         default_factory=dict
     )
-    odds_by_fixture_id: dict[int, list[NormalizedOdds]] = field(default_factory=dict)
     injuries_by_league: dict[tuple[int, int, date], list[InjuryData]] = field(default_factory=dict)
     fail_fixture_fetch: bool = False
     fixture_requests: list[tuple[int, date, int]] = field(default_factory=list)
-    odds_requests: list[int] = field(default_factory=list)
     injury_requests: list[tuple[int, int, date]] = field(default_factory=list)
-    player_stats_requests: list[tuple[int, int, int]] = field(default_factory=list)
 
     provider_name: str = "api-football"
 
@@ -103,19 +110,6 @@ class StubAPIFootballProvider:
         if self.fail_fixture_fetch:
             raise ProviderError(self.provider_name, "primary provider outage")
         return list(self.fixtures_by_league.get((league_id, run_date, season), ()))
-
-    async def fetch_odds_by_fixture(
-        self,
-        *,
-        fixture_id: int,
-        bookmaker_id: int | None = None,
-        timezone: str | None = None,
-    ) -> list[NormalizedOdds]:
-        """Return configured fallback odds for one API-Football fixture."""
-
-        del bookmaker_id, timezone
-        self.odds_requests.append(fixture_id)
-        return list(self.odds_by_fixture_id.get(fixture_id, ()))
 
     async def fetch_injuries(
         self,
@@ -137,29 +131,6 @@ class StubAPIFootballProvider:
         self.injury_requests.append((league_id, season, report_date))
         return list(self.injuries_by_league.get((league_id, season, report_date), ()))
 
-    async def fetch_standings(self, *, league_id: int, season: int) -> list[object]:
-        """Return an empty standings response for tests that do not need stats."""
-
-        del league_id, season
-        return []
-
-    async def fetch_player_stats(
-        self,
-        *,
-        season: int,
-        team_id: int | None = None,
-        league_id: int | None = None,
-        player_id: int | None = None,
-        search: str | None = None,
-    ) -> list[object]:
-        """Record player-stat requests and return no rows."""
-
-        del player_id, search
-        assert team_id is not None
-        assert league_id is not None
-        self.player_stats_requests.append((season, team_id, league_id))
-        return []
-
     async def fetch_head_to_head(
         self,
         *,
@@ -178,67 +149,111 @@ class StubAPIFootballProvider:
 
 
 @dataclass
-class StubFootballDataProvider:
-    """Async stub for Football-Data.org fixture fallback behavior."""
+class StubSportyBetAPIClient:
+    """Async stub for SportyBet API fixture-market fetches."""
 
-    fixtures_by_competition: dict[tuple[str, date, int | None], list[NormalizedFixture]] = field(
-        default_factory=dict
-    )
-    fixture_requests: list[tuple[str, date, int | None]] = field(default_factory=list)
-    provider_name: str = "football-data"
+    rows_by_sportradar_id: dict[str, list[NormalizedOdds]] = field(default_factory=dict)
+    errors_by_sportradar_id: dict[str, ProviderError] = field(default_factory=dict)
+    fetch_calls: list[str] = field(default_factory=list)
 
-    async def fetch_fixtures_by_date(
+    async def fetch_markets(
         self,
+        sportradar_id: str,
         *,
-        run_date: date,
-        competition_code: str,
-        season: int | None = None,
-    ) -> list[NormalizedFixture]:
-        """Return configured fallback fixtures for one competition/date."""
+        fixture: NormalizedFixture | None = None,
+        use_cache: bool = True,
+    ) -> tuple[NormalizedOdds, ...]:
+        """Return configured rows or raise a configured SportyBet API failure."""
 
-        self.fixture_requests.append((competition_code, run_date, season))
-        return list(self.fixtures_by_competition.get((competition_code, run_date, season), ()))
+        del fixture, use_cache
+        self.fetch_calls.append(sportradar_id)
+        if sportradar_id in self.errors_by_sportradar_id:
+            raise self.errors_by_sportradar_id[sportradar_id]
+        return tuple(self.rows_by_sportradar_id.get(sportradar_id, ()))
 
-    async def fetch_standings(
-        self,
-        *,
-        competition_code: str,
-        season: int | None = None,
-        matchday: int | None = None,
-        as_of_date: date | None = None,
-    ) -> list[object]:
-        """Return no standings rows for tests that only cover fixtures."""
+    def build_sportybet_url(self, fixture: NormalizedFixture) -> str:
+        """Return a deterministic public SportyBet URL for the fixture."""
 
-        del competition_code, season, matchday, as_of_date
-        return []
+        assert fixture.sportradar_id is not None
+        return (
+            "https://www.sportybet.com/ng/sport/football/england/"
+            f"premier-league/{fixture.home_team}_vs_{fixture.away_team}/{fixture.sportradar_id}"
+        )
+
+    async def aclose(self) -> None:
+        """Satisfy the async cleanup protocol used by the orchestrator."""
 
 
 @dataclass
-class StubTheOddsAPIProvider:
-    """Async stub for The Odds API sport-level odds requests."""
+class StubSportyBetBrowserScraper:
+    """Async stub for SportyBet browser fallback fixture-market fetches."""
 
-    odds_by_sport: dict[str, list[NormalizedOdds]] = field(default_factory=dict)
-    calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
-    fail: bool = False
-    provider_name: str = "the-odds-api"
+    rows_by_url: dict[str, list[NormalizedOdds]] = field(default_factory=dict)
+    errors_by_url: dict[str, ProviderError] = field(default_factory=dict)
+    scrape_calls: list[str] = field(default_factory=list)
 
-    async def fetch_odds(
+    async def scrape_markets(
+        self,
+        url: str,
+        *,
+        fixture: NormalizedFixture | None = None,
+        use_cache: bool = True,
+    ) -> tuple[NormalizedOdds, ...]:
+        """Return configured rows or raise a configured browser fallback failure."""
+
+        del fixture, use_cache
+        self.scrape_calls.append(url)
+        if url in self.errors_by_url:
+            raise self.errors_by_url[url]
+        return tuple(self.rows_by_url.get(url, ()))
+
+    async def aclose(self) -> None:
+        """Satisfy the async cleanup protocol used by the orchestrator."""
+
+
+@dataclass
+class StubSportyBetTodayCollector:
+    """Async stub for the SportyBet Today Games fixture collector."""
+
+    slate: SportyBetTodaySlate
+    collect_calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    async def collect(
         self,
         *,
-        sport_key: str,
-        markets: tuple[str, ...] = ("h2h",),
-        regions: tuple[str, ...] | None = None,
-        bookmakers: tuple[str, ...] | None = None,
-        commence_time_from: datetime | None = None,
-        commence_time_to: datetime | None = None,
-    ) -> list[NormalizedOdds]:
-        """Return configured odds rows or raise a forced failure."""
+        sports: tuple[str, ...] = (),
+    ) -> SportyBetTodaySlate:
+        """Return the configured slate and record the requested sport filter."""
 
-        del regions, bookmakers, commence_time_from, commence_time_to
-        self.calls.append((sport_key, markets))
-        if self.fail:
-            raise ProviderError(self.provider_name, "quota exhausted")
-        return list(self.odds_by_sport.get(sport_key, ()))
+        self.collect_calls.append(sports)
+        return self.slate
+
+
+@dataclass
+class StubSportyBetFixtureStatsScraper:
+    """Async stub for SportyBet fixture-page detail fetches."""
+
+    results_by_url: dict[str, SportyBetFixtureStatsResult] = field(default_factory=dict)
+    errors_by_url: dict[str, RuntimeError] = field(default_factory=dict)
+    transient_errors_by_url: dict[str, list[RuntimeError]] = field(default_factory=dict)
+    fetch_calls: list[str] = field(default_factory=list)
+
+    async def fetch_fixture_stats(
+        self,
+        *,
+        fixture_url: str,
+        output_dir: object | None = None,
+    ) -> SportyBetFixtureStatsResult:
+        """Return configured fixture details or raise a configured failure."""
+
+        del output_dir
+        self.fetch_calls.append(fixture_url)
+        transient_errors = self.transient_errors_by_url.get(fixture_url)
+        if transient_errors:
+            raise transient_errors.pop(0)
+        if fixture_url in self.errors_by_url:
+            raise self.errors_by_url[fixture_url]
+        return self.results_by_url[fixture_url]
 
 
 @dataclass
@@ -308,90 +323,39 @@ class StubTavilySearchProvider:
         return list(self.injury_articles_by_fixture.get(fixture_ref, ()))
 
 
-def build_the_odds_row() -> NormalizedOdds:
-    """Create one The Odds API row that should match the Arsenal fixture."""
+def build_sportybet_row(
+    *,
+    fixture: NormalizedFixture,
+    market: MarketType,
+    selection: str,
+    provider_selection_name: str,
+    odds: float,
+    provider_market_id: int = 1,
+    line: float | None = None,
+    fetch_source: str = "api",
+) -> NormalizedOdds:
+    """Create one SportyBet-like odds row for orchestrator tests."""
 
     return NormalizedOdds(
-        fixture_ref="the-odds-api:event-123",
-        market=MarketType.MATCH_RESULT,
-        selection="home",
-        odds=1.88,
-        provider="Pinnacle",
-        provider_market_name="h2h",
-        provider_selection_name="Arsenal",
-        sportybet_available=False,
+        fixture_ref=fixture.get_fixture_ref(),
+        market=market,
+        selection=selection,
+        odds=odds,
+        provider="sportybet",
+        provider_market_name="SportyBet Market",
+        provider_selection_name=provider_selection_name,
+        sportybet_available=True,
+        provider_market_id=provider_market_id,
+        line=line,
         raw_metadata={
-            "event_id": "event-123",
-            "sport_key": "soccer_epl",
-            "home_team": "Arsenal",
-            "away_team": "Chelsea",
-            "commence_time": "2026-04-04T19:45:00+00:00",
+            "home_team": fixture.home_team,
+            "away_team": fixture.away_team,
+            "requested_sportradar_id": fixture.sportradar_id,
+            "market_group_id": "1001",
+            "market_group_name": "Main",
+            "sportybet_fetch_source": fetch_source,
         },
         last_updated=datetime(2026, 4, 4, 12, 0, tzinfo=UTC),
-    )
-
-
-def build_api_fallback_row() -> NormalizedOdds:
-    """Create one API-Football odds row used by the fallback-path test."""
-
-    return NormalizedOdds(
-        fixture_ref="api-football:501",
-        market=MarketType.OVER_UNDER_25,
-        selection="over",
-        odds=1.91,
-        provider="Bet365",
-        provider_market_name="Goals Over/Under",
-        provider_selection_name="Over 2.5",
-        sportybet_available=False,
-        line=2.5,
-        raw_metadata={"canonical_market_supported": True},
-        last_updated=datetime(2026, 4, 4, 11, 30, tzinfo=UTC),
-    )
-
-
-def build_nba_the_odds_row() -> NormalizedOdds:
-    """Create one NBA odds row that uses a long-form away-team alias."""
-
-    return NormalizedOdds(
-        fixture_ref="the-odds-api:event-nba-1",
-        market=MarketType.MONEYLINE,
-        selection="away",
-        odds=2.02,
-        provider="Pinnacle",
-        provider_market_name="h2h",
-        provider_selection_name="Los Angeles Clippers",
-        sportybet_available=False,
-        raw_metadata={
-            "event_id": "event-nba-1",
-            "sport_key": "basketball_nba",
-            "home_team": "Sacramento Kings",
-            "away_team": "Los Angeles Clippers",
-            "commence_time": "2026-04-06T01:10:00+00:00",
-        },
-        last_updated=datetime(2026, 4, 5, 20, 0, tzinfo=UTC),
-    )
-
-
-def build_serie_a_alias_row() -> NormalizedOdds:
-    """Create one Serie A row with a short-form team label alias."""
-
-    return NormalizedOdds(
-        fixture_ref="the-odds-api:event-sa-1",
-        market=MarketType.MATCH_RESULT,
-        selection="home",
-        odds=1.95,
-        provider="Pinnacle",
-        provider_market_name="h2h",
-        provider_selection_name="Inter Milan",
-        sportybet_available=False,
-        raw_metadata={
-            "event_id": "event-sa-1",
-            "sport_key": "soccer_italy_serie_a",
-            "home_team": "Inter Milan",
-            "away_team": "AS Roma",
-            "commence_time": "2026-04-05T18:45:00+00:00",
-        },
-        last_updated=datetime(2026, 4, 5, 18, 0, tzinfo=UTC),
     )
 
 
@@ -413,19 +377,76 @@ def build_news_article(*, fixture: NormalizedFixture, url: str, source: str) -> 
     )
 
 
-@pytest.mark.asyncio
-async def test_fetch_fixtures_falls_back_to_football_data_when_api_football_fails() -> None:
-    """Fixtures should fall back to Football-Data.org after a primary failure."""
+def build_today_slate(
+    *,
+    events: tuple[SportyBetTodayEvent, ...],
+) -> SportyBetTodaySlate:
+    """Create one canonical today slate for orchestrator fixture tests."""
 
-    fallback_fixture = build_soccer_fixture(source_provider="football-data", source_id="fd-501")
-    api_provider = StubAPIFootballProvider(fail_fixture_fetch=True)
-    football_data = StubFootballDataProvider(
-        fixtures_by_competition={("PL", date(2026, 4, 4), 2025): [fallback_fixture]}
+    return SportyBetTodaySlate(
+        run_date=date(2026, 4, 4),
+        fetched_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+        timezone="Africa/Lagos",
+        sports=(
+            SportyBetTodaySport(
+                sport_id="sr:sport:1",
+                sport_name="Football",
+                route_slug="football",
+                page_url="https://www.sportybet.com/ng/sport/football/",
+                event_size_hint=len(events),
+            ),
+        ),
+        events=events,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_fixtures_uses_sportybet_today_games_as_canonical_source() -> None:
+    """Fixture ingestion should start from SportyBet Today Games, not provider leagues."""
+
+    today_collector = StubSportyBetTodayCollector(
+        slate=build_today_slate(
+            events=(
+                SportyBetTodayEvent(
+                    event_id="sr:match:9001",
+                    game_id="501",
+                    sport_id="sr:sport:1",
+                    sport_name="Football",
+                    category_id="sr:category:30",
+                    category_name="England",
+                    tournament_id="sr:tournament:17",
+                    tournament_name="Premier League",
+                    kickoff=datetime(2026, 4, 4, 19, 45, tzinfo=UTC),
+                    home_team_name="Arsenal",
+                    away_team_name="Chelsea",
+                    total_market_size=42,
+                    market_count=2,
+                    status=0,
+                    match_status="Not start",
+                ),
+                SportyBetTodayEvent(
+                    event_id="sr:match:9999",
+                    game_id="999",
+                    sport_id="sr:sport:1",
+                    sport_name="Football",
+                    category_id="sr:category:44",
+                    category_name="Spain",
+                    tournament_id="sr:tournament:8",
+                    tournament_name="La Liga",
+                    kickoff=datetime(2026, 4, 4, 20, 0, tzinfo=UTC),
+                    home_team_name="Barcelona",
+                    away_team_name="Valencia",
+                    total_market_size=40,
+                    market_count=2,
+                    status=0,
+                    match_status="Not start",
+                ),
+            ),
+        )
     )
 
     orchestrator = ProviderOrchestrator(
-        api_football=api_provider,
-        football_data=football_data,
+        sportybet_today_collector=today_collector,
     )
 
     fixtures = await orchestrator.fetch_fixtures(
@@ -433,66 +454,99 @@ async def test_fetch_fixtures_falls_back_to_football_data_when_api_football_fail
         competitions=(get_competition("england_premier_league"),),
     )
 
-    assert fixtures == (fallback_fixture,)
-    assert api_provider.fixture_requests[0] == (39, date(2026, 4, 4), 2025)
-    assert football_data.fixture_requests == [("PL", date(2026, 4, 4), 2025)]
+    assert len(fixtures) == 1
+    assert fixtures[0].get_fixture_ref() == "sr:match:9001"
+    assert fixtures[0].source_provider == "sportybet"
+    assert today_collector.collect_calls == [("football",)]
 
 
 @pytest.mark.asyncio
-async def test_fetch_odds_matches_the_odds_rows_and_builds_catalog() -> None:
-    """Primary odds should be matched back onto canonical fixture refs."""
+async def test_fetch_odds_uses_sportybet_api_rows_and_builds_catalog() -> None:
+    """SportyBet API rows should become the canonical odds catalog."""
 
     fixture = build_soccer_fixture()
-    the_odds_api = StubTheOddsAPIProvider(odds_by_sport={"soccer_epl": [build_the_odds_row()]})
+    api_client = StubSportyBetAPIClient(
+        rows_by_sportradar_id={
+            fixture.sportradar_id: [
+                build_sportybet_row(
+                    fixture=fixture,
+                    market=MarketType.MATCH_RESULT,
+                    selection="home",
+                    provider_selection_name="Home",
+                    odds=1.88,
+                )
+            ]
+        }
+    )
+    browser_scraper = StubSportyBetBrowserScraper()
 
     orchestrator = ProviderOrchestrator(
-        api_football=StubAPIFootballProvider(),
-        the_odds_api=the_odds_api,
+        sportybet_api_client=api_client,
+        sportybet_browser_scraper=browser_scraper,
     )
 
     result = await orchestrator.fetch_odds(fixtures=(fixture,))
 
     assert result.unmatched_fixture_refs == ()
-    assert result.providers_attempted == ("the-odds-api",)
-    assert result.catalog.all_rows()[0].fixture_ref == "sr:match:9001"
+    assert result.providers_attempted == ("sportybet_api",)
+    assert result.catalog.all_rows()[0].fixture_ref == fixture.get_fixture_ref()
     assert result.catalog.scoreable_rows()[0].market == MarketType.MATCH_RESULT
-    assert the_odds_api.calls == [
-        (
-            "soccer_epl",
-            (
-                "h2h",
-                "totals",
-                "spreads",
-            ),
-        )
-    ]
+    assert result.catalog.all_rows()[0].raw_metadata["sportybet_fetch_source"] == "api"
+    assert result.catalog.all_rows()[0].raw_metadata["market_group_id"] == "1001"
+    assert api_client.fetch_calls == ["sr:match:9001"]
+    assert browser_scraper.scrape_calls == []
 
 
 @pytest.mark.asyncio
-async def test_fetch_odds_falls_back_to_api_football_and_reports_sportybet_gap() -> None:
-    """Unmatched primary odds should fall back to API-Football before warning."""
+async def test_fetch_odds_falls_back_to_sportybet_browser_when_api_fails() -> None:
+    """Browser fallback should run when the SportyBet API cannot resolve a fixture."""
 
     fixture = build_soccer_fixture()
-    api_provider = StubAPIFootballProvider(odds_by_fixture_id={501: [build_api_fallback_row()]})
-    the_odds_api = StubTheOddsAPIProvider(odds_by_sport={"soccer_epl": []})
+    api_client = StubSportyBetAPIClient(
+        errors_by_sportradar_id={
+            fixture.sportradar_id: ProviderError("sportybet", "api outage")
+        }
+    )
+    sportybet_url = (
+        "https://www.sportybet.com/ng/sport/football/england/"
+        "premier-league/Arsenal_vs_Chelsea/sr:match:9001"
+    )
+    browser_scraper = StubSportyBetBrowserScraper(
+        rows_by_url={
+            sportybet_url: [
+                build_sportybet_row(
+                    fixture=fixture,
+                    market=MarketType.OVER_UNDER_25,
+                    selection="over",
+                    provider_selection_name="Over 2.5",
+                    odds=1.91,
+                    provider_market_id=18,
+                    line=2.5,
+                    fetch_source="browser",
+                )
+            ]
+        }
+    )
 
     orchestrator = ProviderOrchestrator(
-        api_football=api_provider,
-        the_odds_api=the_odds_api,
+        sportybet_api_client=api_client,
+        sportybet_browser_scraper=browser_scraper,
     )
 
     result = await orchestrator.fetch_odds(fixtures=(fixture,))
 
     assert result.unmatched_fixture_refs == ()
-    assert result.providers_attempted == ("the-odds-api", "api-football")
+    assert result.providers_attempted == ("sportybet_api", "sportybet_browser")
     assert result.catalog.scoreable_rows()[0].fixture_ref == "sr:match:9001"
-    assert api_provider.odds_requests == [501]
+    assert result.catalog.all_rows()[0].raw_metadata["sportybet_fetch_source"] == "browser"
+    assert api_client.fetch_calls == ["sr:match:9001"]
+    assert browser_scraper.scrape_calls == [sportybet_url]
     assert not result.warnings
 
 
 @pytest.mark.asyncio
-async def test_fetch_odds_matches_nba_rows_when_team_names_use_common_aliases() -> None:
-    """NBA odds matching should handle `LA` vs `Los Angeles` team aliases."""
+async def test_fetch_odds_reports_missing_sportradar_ids_without_attempting_fetch() -> None:
+    """Fixtures without a Sportradar ID should be reported explicitly."""
 
     fixture = NormalizedFixture(
         sportradar_id=None,
@@ -507,49 +561,23 @@ async def test_fetch_odds_matches_nba_rows_when_team_names_use_common_aliases() 
         home_team_id="30",
         away_team_id="13",
     )
-    the_odds_api = StubTheOddsAPIProvider(
-        odds_by_sport={"basketball_nba": [build_nba_the_odds_row()]}
+    api_client = StubSportyBetAPIClient()
+    browser_scraper = StubSportyBetBrowserScraper()
+    orchestrator = ProviderOrchestrator(
+        sportybet_api_client=api_client,
+        sportybet_browser_scraper=browser_scraper,
     )
-    orchestrator = ProviderOrchestrator(the_odds_api=the_odds_api)
 
     result = await orchestrator.fetch_odds(fixtures=(fixture,))
 
-    assert result.unmatched_fixture_refs == ()
-    assert result.providers_attempted == ("the-odds-api",)
-    assert len(result.catalog.all_rows()) == 1
-    assert result.catalog.all_rows()[0].fixture_ref == "balldontlie:18447959"
-    assert result.catalog.scoreable_rows()[0].market == MarketType.MONEYLINE
-
-
-@pytest.mark.asyncio
-async def test_fetch_odds_matches_soccer_rows_with_short_form_team_aliases() -> None:
-    """Soccer matching should accept short-form aliases with exact kickoff match."""
-
-    fixture = NormalizedFixture(
-        sportradar_id=None,
-        home_team="FC Internazionale Milano",
-        away_team="AS Roma",
-        competition="Serie A",
-        sport=SportName.SOCCER,
-        kickoff=datetime(2026, 4, 5, 18, 45, tzinfo=UTC),
-        source_provider="football-data",
-        source_id="537116",
-        country="Italy",
-        home_team_id="108",
-        away_team_id="100",
+    assert result.unmatched_fixture_refs == ("balldontlie:18447959",)
+    assert result.providers_attempted == ()
+    assert result.catalog.all_rows() == ()
+    assert api_client.fetch_calls == []
+    assert browser_scraper.scrape_calls == []
+    assert "fixture.sportradar_id is required for canonical SportyBet odds fetching" in (
+        result.warnings[0]
     )
-    the_odds_api = StubTheOddsAPIProvider(
-        odds_by_sport={"soccer_italy_serie_a": [build_serie_a_alias_row()]}
-    )
-    orchestrator = ProviderOrchestrator(the_odds_api=the_odds_api)
-
-    result = await orchestrator.fetch_odds(fixtures=(fixture,))
-
-    assert result.unmatched_fixture_refs == ()
-    assert result.providers_attempted == ("the-odds-api",)
-    assert len(result.catalog.all_rows()) == 1
-    assert result.catalog.all_rows()[0].fixture_ref == "football-data:537116"
-    assert result.catalog.scoreable_rows()[0].market == MarketType.MATCH_RESULT
 
 
 @pytest.mark.asyncio
@@ -586,6 +614,263 @@ async def test_fetch_news_uses_tavily_for_fixtures_without_rss_coverage() -> Non
         nba_fixture.get_fixture_ref(),
     }
     assert tavily_provider.match_calls == [nba_fixture.get_fixture_ref()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_stats_uses_sportybet_fixture_details_as_canonical_soccer_source() -> None:
+    """Soccer team stats should now be derived from SportyBet fixture details."""
+
+    fixture = build_soccer_fixture(source_provider="sportybet")
+    fixture_url = build_fixture_page_url(
+        event_id=fixture.sportradar_id or "",
+        home_team=fixture.home_team,
+        away_team=fixture.away_team,
+        country=fixture.country or "",
+        competition=fixture.competition,
+        sport="football",
+    )
+    scraper_result = SportyBetFixtureStatsResult(
+        fixture_url=fixture_url,
+        final_url=fixture_url,
+        event_id=fixture.sportradar_id or "",
+        match_id="9001",
+        page_title="Arsenal vs Chelsea",
+        fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        home_team_uid="sportybet-home-42",
+        away_team_uid="sportybet-away-49",
+        widget_loader_status="loaded",
+        team_stats=(
+            TeamStats(
+                team_id="sportybet-home-42",
+                team_name="Arsenal FC",
+                sport=SportName.SOCCER,
+                source_provider="sportybet_fixture_stats",
+                fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+                competition="Premier League",
+                season="25/26",
+                matches_played=32,
+                wins=21,
+                draws=6,
+                losses=5,
+                goals_for=62,
+                goals_against=28,
+                form="WWDWWL",
+                position=2,
+                points=69,
+                home_wins=12,
+                away_wins=9,
+                avg_goals_scored=1.9375,
+                avg_goals_conceded=0.875,
+            ),
+            TeamStats(
+                team_id="sportybet-away-49",
+                team_name="Chelsea FC",
+                sport=SportName.SOCCER,
+                source_provider="sportybet_fixture_stats",
+                fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+                competition="Premier League",
+                season="25/26",
+                matches_played=32,
+                wins=15,
+                draws=8,
+                losses=9,
+                goals_for=51,
+                goals_against=37,
+                form="DLWWDW",
+                position=6,
+                points=53,
+                home_wins=9,
+                away_wins=6,
+                avg_goals_scored=1.59375,
+                avg_goals_conceded=1.15625,
+            ),
+        ),
+        widgets=(),
+        responses=(),
+    )
+    scraper = StubSportyBetFixtureStatsScraper(
+        results_by_url={fixture_url: scraper_result}
+    )
+    orchestrator = ProviderOrchestrator(
+        sportybet_fixture_stats_scraper=scraper,  # type: ignore[arg-type]
+    )
+
+    result = await orchestrator.fetch_stats(fixtures=(fixture,))
+
+    assert result.providers_attempted == ("sportybet_fixture_stats",)
+    assert result.player_stats == ()
+    assert result.warnings == ()
+    assert scraper.fetch_calls == [fixture_url]
+    assert {stats.team_name for stats in result.team_stats} == {"Arsenal", "Chelsea"}
+    home_stats = next(stats for stats in result.team_stats if stats.team_name == "Arsenal")
+    away_stats = next(stats for stats in result.team_stats if stats.team_name == "Chelsea")
+    assert home_stats.team_id == "42"
+    assert away_stats.team_id == "49"
+    assert home_stats.form == "WWDWWL"
+    assert away_stats.form == "DLWWDW"
+
+
+@pytest.mark.asyncio
+async def test_fetch_stats_reuses_cached_fixture_detail_fetch_after_details_stage() -> None:
+    """A fixture-details fetch should seed the later stats stage without another browser run."""
+
+    fixture = build_soccer_fixture(source_provider="sportybet")
+    fixture_url = build_fixture_page_url(
+        event_id=fixture.sportradar_id or "",
+        home_team=fixture.home_team,
+        away_team=fixture.away_team,
+        country=fixture.country or "",
+        competition=fixture.competition,
+        sport="football",
+    )
+    scraper_result = SportyBetFixtureStatsResult(
+        fixture_url=fixture_url,
+        final_url=fixture_url,
+        event_id=fixture.sportradar_id or "",
+        match_id="9001",
+        page_title="Arsenal vs Chelsea",
+        fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        home_team_uid="sportybet-home-42",
+        away_team_uid="sportybet-away-49",
+        widget_loader_status="loaded",
+        team_stats=(
+            TeamStats(
+                team_id="sportybet-home-42",
+                team_name="Arsenal FC",
+                sport=SportName.SOCCER,
+                source_provider="sportybet_fixture_stats",
+                fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+                competition="Premier League",
+                matches_played=32,
+                wins=21,
+                draws=6,
+                losses=5,
+            ),
+            TeamStats(
+                team_id="sportybet-away-49",
+                team_name="Chelsea FC",
+                sport=SportName.SOCCER,
+                source_provider="sportybet_fixture_stats",
+                fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+                competition="Premier League",
+                matches_played=32,
+                wins=15,
+                draws=8,
+                losses=9,
+            ),
+        ),
+        widgets=(
+            SportyBetFixtureStatsWidget(
+                widget_key="teamInfo",
+                widget_type="team.info",
+                status="mounted",
+                content_lines=("Home manager: Mikel Arteta",),
+            ),
+        ),
+        responses=(),
+    )
+    scraper = StubSportyBetFixtureStatsScraper(
+        results_by_url={fixture_url: scraper_result}
+    )
+    orchestrator = ProviderOrchestrator(
+        sportybet_fixture_stats_scraper=scraper,  # type: ignore[arg-type]
+    )
+
+    details_result = await orchestrator.fetch_fixture_details(fixtures=(fixture,))
+    stats_result = await orchestrator.fetch_stats(fixtures=(fixture,))
+
+    assert len(details_result.fixture_details) == 1
+    assert len(stats_result.team_stats) == 2
+    assert scraper.fetch_calls == [fixture_url]
+
+
+@pytest.mark.asyncio
+async def test_fetch_fixture_details_retries_transient_sportybet_failures() -> None:
+    """The canonical fixture-details path should retry transient SportyBet failures."""
+
+    fixture = build_soccer_fixture(source_provider="sportybet")
+    fixture_url = build_fixture_page_url(
+        event_id=fixture.sportradar_id or "",
+        home_team=fixture.home_team,
+        away_team=fixture.away_team,
+        country=fixture.country or "",
+        competition=fixture.competition,
+        sport="football",
+    )
+    scraper_result = SportyBetFixtureStatsResult(
+        fixture_url=fixture_url,
+        final_url=fixture_url,
+        event_id=fixture.sportradar_id or "",
+        match_id="9001",
+        page_title="Arsenal vs Chelsea",
+        fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        widget_loader_status="loaded",
+        widgets=(),
+        responses=(),
+    )
+    scraper = StubSportyBetFixtureStatsScraper(
+        results_by_url={fixture_url: scraper_result},
+        transient_errors_by_url={fixture_url: [RuntimeError("temporary timeout")]},
+    )
+    orchestrator = ProviderOrchestrator(
+        sportybet_fixture_stats_scraper=scraper,  # type: ignore[arg-type]
+        sportybet_fixture_detail_retry_backoff_seconds=0.0,
+    )
+
+    result = await orchestrator.fetch_fixture_details(fixtures=(fixture,))
+
+    assert len(result.fixture_details) == 1
+    assert result.warnings == ()
+    assert scraper.fetch_calls == [fixture_url, fixture_url]
+
+
+@pytest.mark.asyncio
+async def test_fetch_fixture_details_uses_sportybet_fixture_page_scraper() -> None:
+    """Fixture details should be fetched from SportyBet fixture pages by Sportradar ID."""
+
+    fixture = build_soccer_fixture(source_provider="sportybet")
+    fixture_url = build_fixture_page_url(
+        event_id=fixture.sportradar_id or "",
+        home_team=fixture.home_team,
+        away_team=fixture.away_team,
+        country=fixture.country or "",
+        competition=fixture.competition,
+        sport="football",
+    )
+    scraper_result = SportyBetFixtureStatsResult(
+        fixture_url=fixture_url,
+        final_url=fixture_url,
+        event_id=fixture.sportradar_id or "",
+        match_id="9001",
+        page_title="Arsenal vs Chelsea",
+        fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        widget_loader_status="loaded",
+        widgets=(
+            SportyBetFixtureStatsWidget(
+                widget_key="teamInfo",
+                widget_type="team.info",
+                status="mounted",
+                content_lines=("Home manager: Mikel Arteta",),
+            ),
+        ),
+    )
+    scraper = StubSportyBetFixtureStatsScraper(
+        results_by_url={fixture_url: scraper_result}
+    )
+    orchestrator = ProviderOrchestrator(
+        sportybet_fixture_stats_scraper=scraper,  # type: ignore[arg-type]
+    )
+
+    result = await orchestrator.fetch_fixture_details(fixtures=(fixture,))
+
+    assert scraper.fetch_calls == [fixture_url]
+    assert result.providers_attempted == ("sportybet_fixture_stats",)
+    assert result.warnings == ()
+    assert len(result.fixture_details) == 1
+    assert result.fixture_details[0].fixture_ref == fixture.get_fixture_ref()
+    assert result.fixture_details[0].sections[0].content_lines == (
+        "Home manager: Mikel Arteta",
+    )
 
 
 @pytest.mark.asyncio
@@ -640,10 +925,69 @@ async def test_fetch_injuries_uses_tavily_when_structured_provider_has_no_match(
 
 
 @pytest.mark.asyncio
-async def test_fetch_markets_fails_fast_until_sportybet_steps_exist() -> None:
-    """Market fetching should stay explicit until the scraper steps are built."""
+async def test_fetch_injuries_warns_for_today_slate_competitions_without_provider_routing() -> None:
+    """Unsupported today-slate competitions should still reach injury fallback with a warning."""
 
-    orchestrator = ProviderOrchestrator()
+    unsupported_fixture = NormalizedFixture(
+        sportradar_id="sr:match:9903",
+        home_team="FC Noah",
+        away_team="Pyunik",
+        competition="Armenian Premier League",
+        sport=SportName.SOCCER,
+        kickoff=datetime(2026, 4, 4, 12, 30, tzinfo=UTC),
+        source_provider="sportybet",
+        source_id="9903",
+        country="Armenia",
+    )
+    tavily_article = build_news_article(
+        fixture=unsupported_fixture,
+        url="https://example.com/armenia/injuries",
+        source="Armenia Sports",
+    )
+    tavily_provider = StubTavilySearchProvider(
+        injury_articles_by_fixture={unsupported_fixture.get_fixture_ref(): [tavily_article]}
+    )
+    orchestrator = ProviderOrchestrator(
+        api_football=StubAPIFootballProvider(),
+        tavily_search=tavily_provider,
+    )
 
-    with pytest.raises(ProviderError, match="Steps 22-24"):
-        await orchestrator.fetch_markets(fixtures=(build_soccer_fixture(),))
+    result = await orchestrator.fetch_injuries(fixtures=(unsupported_fixture,))
+
+    assert result.injuries == ()
+    assert result.supporting_articles == (tavily_article,)
+    assert result.warnings == (
+        "Structured injury coverage is unavailable for 1 today-slate fixture from "
+        "competitions without provider routing: Armenian Premier League (Armenia).",
+    )
+    assert tavily_provider.injury_calls == [unsupported_fixture.get_fixture_ref()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_markets_reuses_canonical_sportybet_flow() -> None:
+    """Market fetching should use the same canonical SportyBet path as fetch_odds."""
+
+    fixture = build_soccer_fixture()
+    api_client = StubSportyBetAPIClient(
+        rows_by_sportradar_id={
+            fixture.sportradar_id: [
+                build_sportybet_row(
+                    fixture=fixture,
+                    market=MarketType.MATCH_RESULT,
+                    selection="home",
+                    provider_selection_name="Home",
+                    odds=1.86,
+                )
+            ]
+        }
+    )
+    orchestrator = ProviderOrchestrator(
+        sportybet_api_client=api_client,
+        sportybet_browser_scraper=StubSportyBetBrowserScraper(),
+    )
+
+    result = await orchestrator.fetch_markets(fixtures=(fixture,))
+
+    assert result.unmatched_fixture_refs == ()
+    assert result.providers_attempted == ("sportybet_api",)
+    assert result.catalog.scoreable_rows()[0].market == MarketType.MATCH_RESULT

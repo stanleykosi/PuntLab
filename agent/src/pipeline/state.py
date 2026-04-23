@@ -21,6 +21,7 @@ from src.schemas.accumulators import AccumulatorSlip, ExplainedAccumulator, Reso
 from src.schemas.analysis import MatchContext, MatchScore, RankedMatch
 from src.schemas.common import ensure_timezone_aware, require_non_blank_text
 from src.schemas.fixtures import NormalizedFixture
+from src.schemas.fixture_details import FixtureDetails
 from src.schemas.news import NewsArticle
 from src.schemas.odds import NormalizedOdds
 from src.schemas.stats import InjuryData, PlayerStats, TeamStats
@@ -120,6 +121,13 @@ class PipelineState(BaseModel):
     player_stats: list[PlayerStats] = Field(
         default_factory=list,
         description="Stage 1 player-stat outputs gathered during ingestion.",
+    )
+    fixture_details: list[FixtureDetails] = Field(
+        default_factory=list,
+        description=(
+            "Stage 1 SportyBet fixture-page detail snapshots used by research, "
+            "including lineups, stats, team info, previews, H2H, and standings."
+        ),
     )
     injuries: list[InjuryData] = Field(
         default_factory=list,

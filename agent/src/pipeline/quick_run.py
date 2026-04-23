@@ -45,7 +45,7 @@ type PrintFn = Callable[[str], None]
 type LiveProgressState = dict[str, object]
 
 _FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
     flags=re.IGNORECASE,
 )
 _SPINNER_FRAMES = ("-", "\\", "|", "/")
@@ -220,6 +220,7 @@ def _state_counts(state: PipelineState) -> dict[str, int]:
         "catalog_rows": len(state.odds_market_catalog.all_rows()),
         "team_stats": len(state.team_stats),
         "player_stats": len(state.player_stats),
+        "fixture_details": len(state.fixture_details),
         "injuries": len(state.injuries),
         "news": len(state.news_articles),
         "contexts": len(state.match_contexts),
@@ -503,10 +504,16 @@ def _print_slip_details(
         if isinstance(slip, ExplainedAccumulator):
             print_fn(f"      rationale: {slip.rationale}")
         for leg in slip.legs:
+            market_label = leg.market_label or (
+                leg.canonical_market.value
+                if leg.canonical_market is not None
+                else leg.market
+            )
             print_fn(
                 "      "
                 f"leg {leg.leg_number}: {leg.home_team} vs {leg.away_team} | "
-                f"market={leg.market.value} | selection={leg.selection} | "
+                f"market={market_label} | "
+                f"selection={leg.selection} | "
                 f"odds={leg.odds:.2f} | provider={leg.provider}"
             )
             if leg.rationale:
@@ -1110,10 +1117,6 @@ def _normalize_error_summary_key(message: str) -> str:
         return "market_resolution: fixture resolution failed"
     if normalized_lower.startswith("market resolution skipped for "):
         return "market_resolution: fixture skipped"
-    if normalized_lower.startswith("football-data.org fixture fetch failed"):
-        return "ingestion: football-data fixture fetch failed"
-    if normalized_lower.startswith("the odds api odds fetch failed"):
-        return "ingestion: odds api fetch failed"
     if normalized_lower.startswith("balldontlie stats fetch failed"):
         return "ingestion: balldontlie stats fetch failed"
     if normalized_lower.startswith("odds coverage is incomplete for fixtures:"):

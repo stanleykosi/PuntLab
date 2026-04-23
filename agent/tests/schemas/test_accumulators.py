@@ -79,9 +79,9 @@ def test_accumulator_slip_validates_leg_count_numbering_and_total_odds() -> None
             market=MarketType.TOTAL_POINTS,
             selection="Over",
             odds=1.91,
-            provider="the-odds-api",
+            provider="sportybet",
             confidence=0.68,
-            resolution_source=ResolutionSource.EXTERNAL_ODDS,
+            resolution_source=ResolutionSource.SPORTYBET_BROWSER,
             line=220.5,
         ),
     )

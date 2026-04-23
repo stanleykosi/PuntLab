@@ -47,6 +47,10 @@ dev = [
 [project.scripts]
 puntlab-agent = "src.main:run"
 puntlab-agent-quick-run = "src.pipeline.quick_run:run"
+puntlab-agent-sportybet-fixture-probe = "src.scrapers.sportybet_fixture_probe:run"
+puntlab-agent-sportybet-fixture-stats = "src.scrapers.sportybet_fixture_stats:run"
+puntlab-agent-sportybet-today = "src.scrapers.sportybet_today:run"
+puntlab-agent-sportybet-today-full-report = "src.scrapers.sportybet_today_full_report:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

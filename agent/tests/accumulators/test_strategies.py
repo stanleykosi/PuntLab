@@ -27,9 +27,10 @@ def build_ranked_match(
     competition: str = "Premier League",
     home_team: str | None = None,
     away_team: str | None = None,
-    recommended_market: MarketType = MarketType.MATCH_RESULT,
-    recommended_selection: str = "home",
+    recommended_market: str | MarketType = "full_time_result",
+    recommended_selection: str = "Home",
     recommended_odds: float = 1.72,
+    recommended_canonical_market: MarketType | None = MarketType.MATCH_RESULT,
 ) -> RankedMatch:
     """Build a canonical ranked-match record for strategy tests."""
 
@@ -53,6 +54,8 @@ def build_ranked_match(
             statistical=0.61,
         ),
         recommended_market=recommended_market,
+        recommended_market_label="Full Time Result",
+        recommended_canonical_market=recommended_canonical_market,
         recommended_selection=recommended_selection,
         recommended_odds=recommended_odds,
         qualitative_summary=f"{home_label} carries the stronger recent edge.",
@@ -67,11 +70,12 @@ def build_resolved_market(
     competition: str = "Premier League",
     home_team: str,
     away_team: str,
-    market: MarketType = MarketType.MATCH_RESULT,
-    selection: str = "home",
+    market: str | MarketType = "full_time_result",
+    selection: str = "Home",
     odds: float = 1.72,
     resolution_source: ResolutionSource = ResolutionSource.SPORTYBET_API,
     provider: str = "sportybet",
+    canonical_market: MarketType | None = MarketType.MATCH_RESULT,
 ) -> ResolvedMarket:
     """Build a canonical resolved market for strategy tests."""
 
@@ -82,6 +86,7 @@ def build_resolved_market(
         home_team=home_team,
         away_team=away_team,
         market=market,
+        canonical_market=canonical_market,
         selection=selection,
         odds=odds,
         provider=provider,
@@ -159,8 +164,8 @@ def test_select_legs_prefers_recommended_markets_and_numbers_output() -> None:
             market=MarketType.OVER_UNDER_25,
             selection="over",
             odds=2.20,
-            resolution_source=ResolutionSource.EXTERNAL_ODDS,
-            provider="the-odds-api",
+            resolution_source=ResolutionSource.SPORTYBET_BROWSER,
+            provider="sportybet",
         ),
     )
 
@@ -173,8 +178,9 @@ def test_select_legs_prefers_recommended_markets_and_numbers_output() -> None:
     assert len(selected) == 4
     assert tuple(leg.leg_number for leg in selected) == (1, 2, 3, 4)
     assert selected[0].fixture_ref == ranked_matches[0].fixture_ref
-    assert all(leg.market is MarketType.MATCH_RESULT for leg in selected)
-    assert selected[0].selection == "home"
+    assert all(leg.market == "full_time_result" for leg in selected)
+    assert all(leg.canonical_market is MarketType.MATCH_RESULT for leg in selected)
+    assert selected[0].selection == "Home"
 
 
 def test_select_legs_respects_excluded_fixture_combinations() -> None:

@@ -93,6 +93,7 @@ def build_match_detail_payload() -> dict[str, object]:
         "data": {
             "event": {
                 "eventId": "sr:match:61301159",
+                "totalMarketSize": 42,
                 "homeTeamName": "Arsenal",
                 "awayTeamName": "Chelsea",
                 "sport": {"id": "sr:sport:1", "name": "Football"},
@@ -102,21 +103,25 @@ def build_match_detail_payload() -> dict[str, object]:
                 },
                 "markets": [
                     {
-                        "id": 45,
+                        "id": 1,
                         "name": "1X2",
+                        "groupId": "1001",
+                        "group": "Main",
                         "outcomes": [
-                            {"id": "1", "desc": "Home", "odds": 183, "status": 1},
-                            {"id": "2", "desc": "Draw", "odds": 350, "status": 1},
-                            {"id": "3", "desc": "Away", "odds": 420, "status": 1},
+                            {"id": "1", "desc": "Home", "odds": 183, "isActive": True},
+                            {"id": "2", "desc": "Draw", "odds": 350, "isActive": True},
+                            {"id": "3", "desc": "Away", "odds": 420, "isActive": True},
                         ],
                     },
                     {
-                        "id": 47,
+                        "id": 18,
                         "name": "Over/Under",
                         "specifier": "total=2.5",
+                        "groupId": "1002",
+                        "group": "Goals",
                         "outcomes": [
-                            {"id": "425", "desc": "Over 2.5", "odds": 191, "status": 1},
-                            {"id": "426", "desc": "Under 2.5", "odds": 182, "status": 1},
+                            {"id": "425", "desc": "Over 2.5", "odds": 191, "isActive": 1},
+                            {"id": "426", "desc": "Under 2.5", "odds": 182, "isActive": 1},
                         ],
                     },
                 ],
@@ -152,7 +157,7 @@ async def test_fetch_markets_normalizes_payload_and_reuses_cache() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal request_count
         request_count += 1
-        assert request.url.path == "/api/ng/factsCenter/pc/matchDetail"
+        assert request.url.path == "/api/ng/factsCenter/event"
         assert request.url.params["eventId"] == "sr:match:61301159"
         return httpx.Response(200, json=build_match_detail_payload(), request=request)
 
@@ -169,8 +174,12 @@ async def test_fetch_markets_normalizes_payload_and_reuses_cache() -> None:
     assert len(first_result) == 5
     assert second_result == first_result
     assert first_result[0].market == MarketType.MATCH_RESULT
-    assert first_result[0].provider_market_id == 45
+    assert first_result[0].provider_market_id == 1
     assert first_result[0].odds == pytest.approx(1.83)
+    assert first_result[0].raw_metadata["market_group_id"] == "1001"
+    assert first_result[0].raw_metadata["market_group_name"] == "Main"
+    assert first_result[0].raw_metadata["event_total_market_size"] == 42
+    assert first_result[0].raw_metadata["sportybet_fetch_source"] == "api"
     assert first_result[3].market == MarketType.OVER_UNDER_25
     assert first_result[3].line == pytest.approx(2.5)
 
@@ -191,10 +200,7 @@ async def test_fetch_markets_falls_back_to_second_endpoint_and_rotates_user_agen
             request.url.path + (f"?{query_fragment}" if query_fragment else "")
         )
         request_user_agents.append(request.headers["User-Agent"])
-        if (
-            request.url.path == "/api/ng/factsCenter/pc/matchDetail"
-            and "matchId" not in query_fragment
-        ):
+        if request.url.path == "/api/ng/factsCenter/event":
             return httpx.Response(404, json={"message": "missing"}, request=request)
         return httpx.Response(200, json=build_match_detail_payload(), request=request)
 
@@ -208,8 +214,8 @@ async def test_fetch_markets_falls_back_to_second_endpoint_and_rotates_user_agen
 
     assert len(result) == 5
     assert requested_paths == [
+        "/api/ng/factsCenter/event?eventId=sr:match:61301159",
         "/api/ng/factsCenter/pc/matchDetail?eventId=sr:match:61301159",
-        "/api/ng/factsCenter/pc/matchDetail?matchId=sr:match:61301159",
     ]
     assert request_user_agents == ["agent-one", "agent-two"]
 
@@ -230,7 +236,7 @@ async def test_fetch_markets_raises_when_no_matching_event_is_present() -> None:
                 "awayTeamName": "Fixture",
                 "sport": {"name": "Football"},
                 "category": {"tournament": {"name": "Premier League"}},
-                "markets": [{"id": 45, "name": "1X2", "outcomes": [{"desc": "Home", "odds": 190}]}],
+                "markets": [{"id": 1, "name": "1X2", "outcomes": [{"desc": "Home", "odds": 190}]}],
             }
         }
     }

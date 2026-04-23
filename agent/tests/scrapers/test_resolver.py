@@ -1,8 +1,8 @@
 """Tests for PuntLab's SportyBet market resolver.
 
-Purpose: verify the resolver's source fallback order, canonical market
-matching, external-odds fixture reconciliation, and error handling without
-live SportyBet or odds-provider dependencies.
+Purpose: verify the resolver's source fallback order, prefetched-market
+handling, canonical market matching, and error handling without live
+SportyBet dependencies.
 Scope: unit tests for `src.scrapers.resolver`.
 Dependencies: pytest, the shared schemas, and lightweight async stub scraper
 implementations that emulate the resolver's collaborators.
@@ -133,7 +133,7 @@ def build_basketball_fixture() -> NormalizedFixture:
 def build_ranked_match(
     *,
     fixture: NormalizedFixture,
-    market: MarketType | None,
+    market: str | MarketType | None,
     selection: str | None,
     recommended_odds: float | None = None,
 ) -> RankedMatch:
@@ -167,12 +167,14 @@ def build_ranked_match(
 def build_sportybet_row(
     *,
     fixture: NormalizedFixture,
-    market: MarketType,
+    market: MarketType | None,
     selection: str,
     provider_selection_name: str,
     odds: float,
+    provider_market_name: str = "SportyBet Market",
     line: float | None = None,
-    provider_market_id: int = 45,
+    provider_market_id: int = 1,
+    fetch_source: str = "api",
 ) -> NormalizedOdds:
     """Create one SportyBet-like normalized odds row for resolver tests."""
 
@@ -182,7 +184,7 @@ def build_sportybet_row(
         selection=selection,
         odds=odds,
         provider="sportybet",
-        provider_market_name="SportyBet Market",
+        provider_market_name=provider_market_name,
         provider_selection_name=provider_selection_name,
         sportybet_available=True,
         line=line,
@@ -191,40 +193,9 @@ def build_sportybet_row(
             "home_team": fixture.home_team,
             "away_team": fixture.away_team,
             "requested_sportradar_id": fixture.sportradar_id,
+            "sportybet_fetch_source": fetch_source,
         },
         last_updated=datetime(2026, 4, 4, 12, 0, tzinfo=UTC),
-    )
-
-
-def build_external_row(
-    *,
-    fixture: NormalizedFixture,
-    market: MarketType,
-    selection: str,
-    provider_selection_name: str,
-    odds: float,
-    line: float | None = None,
-) -> NormalizedOdds:
-    """Create one external fallback odds row keyed by provider event metadata."""
-
-    return NormalizedOdds(
-        fixture_ref="the-odds-api:event-123",
-        market=market,
-        selection=selection,
-        odds=odds,
-        provider="Pinnacle",
-        provider_market_name="spreads" if market == MarketType.POINT_SPREAD else "totals",
-        provider_selection_name=provider_selection_name,
-        sportybet_available=False,
-        line=line,
-        raw_metadata={
-            "sport_key": "basketball_nba",
-            "event_id": "event-123",
-            "home_team": fixture.home_team,
-            "away_team": fixture.away_team,
-            "commence_time": fixture.kickoff.isoformat(),
-        },
-        last_updated=datetime(2026, 4, 4, 11, 55, tzinfo=UTC),
     )
 
 
@@ -263,8 +234,9 @@ async def test_resolve_returns_api_match_without_using_browser() -> None:
     resolved = await resolver.resolve(fixture, analysis)
 
     assert resolved.resolution_source.value == "sportybet_api"
-    assert resolved.selection == "home"
-    assert resolved.sportybet_market_id == 45
+    assert resolved.canonical_market is MarketType.MATCH_RESULT
+    assert resolved.selection == "Home"
+    assert resolved.sportybet_market_id == 1
     assert browser_scraper.scrape_calls == []
 
 
@@ -299,7 +271,8 @@ async def test_resolve_falls_back_to_browser_when_api_rows_do_not_match() -> Non
                 provider_selection_name="Over 2.5",
                 odds=1.91,
                 line=2.5,
-                provider_market_id=47,
+                provider_market_id=18,
+                fetch_source="browser",
             ),
         )
     )
@@ -308,13 +281,14 @@ async def test_resolve_falls_back_to_browser_when_api_rows_do_not_match() -> Non
     resolved = await resolver.resolve(fixture, analysis)
 
     assert resolved.resolution_source.value == "sportybet_browser"
-    assert resolved.selection == "over"
+    assert resolved.canonical_market is MarketType.OVER_UNDER_25
+    assert resolved.selection == "Over 2.5"
     assert len(browser_scraper.scrape_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_resolve_falls_back_to_external_odds_and_matches_fixture_metadata() -> None:
-    """External odds should be matched by preserved fixture metadata when needed."""
+async def test_resolve_prefers_prefetched_rows_before_live_fetch() -> None:
+    """Prefetched SportyBet rows should resolve without triggering fresh fetches."""
 
     fixture = build_basketball_fixture()
     analysis = build_ranked_match(
@@ -334,30 +308,81 @@ async def test_resolve_falls_back_to_external_odds_and_matches_fixture_metadata(
     resolved = await resolver.resolve(
         fixture,
         analysis,
-        external_odds=(
-            build_external_row(
+        prefetched_rows=(
+            build_sportybet_row(
                 fixture=fixture,
                 market=MarketType.POINT_SPREAD,
                 selection="Los Angeles Lakers",
                 provider_selection_name="Los Angeles Lakers",
                 odds=1.91,
                 line=-4.5,
+                provider_market_id=7,
             ),
-            build_external_row(
+            build_sportybet_row(
                 fixture=fixture,
                 market=MarketType.POINT_SPREAD,
                 selection="Los Angeles Lakers",
                 provider_selection_name="Los Angeles Lakers",
                 odds=2.35,
                 line=-8.5,
+                provider_market_id=7,
             ),
         ),
     )
 
-    assert resolved.resolution_source.value == "external_odds"
-    assert resolved.provider == "Pinnacle"
-    assert resolved.selection == "home"
+    assert resolved.resolution_source.value == "sportybet_api"
+    assert resolved.provider == "sportybet"
+    assert resolved.canonical_market is MarketType.POINT_SPREAD
+    assert resolved.selection == "Los Angeles Lakers"
     assert resolved.line == pytest.approx(-4.5)
+    assert api_client.fetch_calls == []
+    assert browser_scraper.scrape_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_matches_provider_native_unmapped_market_exactly() -> None:
+    """Exact provider-native recommendations should resolve without canonical mapping."""
+
+    fixture = build_soccer_fixture()
+    analysis = build_ranked_match(
+        fixture=fixture,
+        market="team_to_score_first",
+        selection="Arsenal",
+        recommended_odds=1.95,
+    )
+    api_client = StubSportyBetAPIClient(
+        rows=(
+            build_sportybet_row(
+                fixture=fixture,
+                market=None,
+                selection="Arsenal",
+                provider_selection_name="Arsenal",
+                provider_market_name="Team To Score First",
+                odds=1.95,
+                provider_market_id=22,
+            ),
+            build_sportybet_row(
+                fixture=fixture,
+                market=None,
+                selection="Chelsea",
+                provider_selection_name="Chelsea",
+                provider_market_name="Team To Score First",
+                odds=2.05,
+                provider_market_id=22,
+            ),
+        )
+    )
+    browser_scraper = StubSportyBetBrowserScraper()
+    resolver = MarketResolver(api_client=api_client, browser_scraper=browser_scraper)
+
+    resolved = await resolver.resolve(fixture, analysis)
+
+    assert resolved.resolution_source.value == "sportybet_api"
+    assert resolved.market == "team_to_score_first"
+    assert resolved.canonical_market is None
+    assert resolved.selection == "Arsenal"
+    assert resolved.sportybet_market_id == 22
+    assert browser_scraper.scrape_calls == []
 
 
 @pytest.mark.asyncio

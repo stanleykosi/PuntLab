@@ -1,10 +1,10 @@
 """HTTP-based SportyBet market interceptor for PuntLab's resolver pipeline.
 
-Purpose: fetch SportyBet pre-match market data through lightweight HTTP
-requests before the slower browser fallback is attempted.
+Purpose: fetch SportyBet market data through lightweight HTTP requests before
+the slower browser fallback is attempted.
 Scope: public SportyBet URL construction, rotating user-agent selection,
-Redis-backed market caching, candidate API endpoint fallback, and normalized
-market parsing into `NormalizedOdds`.
+Redis-backed market caching, current API endpoint fallback, grouped event
+catalog construction, and normalization into `NormalizedOdds`.
 Dependencies: `httpx` transport via `RateLimitedClient`, shared Redis cache
 helpers, normalized fixture and odds schemas, and canonical market enums.
 """
@@ -30,8 +30,11 @@ from src.schemas.odds import NormalizedOdds
 SPORTYBET_BASE_URL: Final[str] = "https://www.sportybet.com"
 SPORTYBET_COUNTRY_CODE: Final[str] = "ng"
 SPORTYBET_API_PATH_TEMPLATES: Final[tuple[str, ...]] = (
+    "/api/ng/factsCenter/event?eventId={sportradar_id}",
+    # Legacy endpoints are kept as trailing fallbacks only because SportyBet
+    # has historically changed routes without notice. The canonical path is
+    # `factsCenter/event?eventId=sr:match:*`.
     "/api/ng/factsCenter/pc/matchDetail?eventId={sportradar_id}",
-    "/api/ng/factsCenter/pc/matchDetail?matchId={sportradar_id}",
     "/api/ng/factsCenter/eventDetail?eventId={sportradar_id}",
 )
 SPORTYBET_DEFAULT_HEADERS: Final[dict[str, str]] = {
@@ -45,8 +48,7 @@ SPORTYBET_RATE_LIMIT_POLICY: Final[RateLimitPolicy] = RateLimitPolicy(
     window_seconds=60,
 )
 SPORTYBET_MARKET_IDS: Final[dict[int, MarketType]] = {
-    45: MarketType.MATCH_RESULT,
-    47: MarketType.OVER_UNDER_25,
+    1: MarketType.MATCH_RESULT,
 }
 DEFAULT_USER_AGENTS: Final[tuple[str, ...]] = (
     (
@@ -62,7 +64,6 @@ DEFAULT_USER_AGENTS: Final[tuple[str, ...]] = (
         "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
     ),
 )
-_ACTIVE_STATUSES: Final[frozenset[int]] = frozenset({0, 1})
 _LINE_MARKETS: Final[frozenset[MarketType]] = frozenset(
     {
         MarketType.ASIAN_HANDICAP,
@@ -132,6 +133,52 @@ class ParsedFixtureContext:
     competition: str
     home_team: str
     away_team: str
+
+
+@dataclass(frozen=True, slots=True)
+class SportyBetMarketGroup:
+    """One SportyBet market group preserved from the event payload.
+
+    Inputs:
+        Raw grouped market nodes from SportyBet's current `factsCenter/event`
+        payload.
+
+    Outputs:
+        A deterministic group container used to arrange and traverse the
+        fetched market universe without losing SportyBet's own grouping.
+    """
+
+    group_id: str
+    group_name: str
+    markets: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SportyBetEventCatalog:
+    """Structured SportyBet event snapshot grouped by market sections.
+
+    Inputs:
+        One normalized SportyBet event payload with fixture metadata and raw
+        grouped market nodes.
+
+    Outputs:
+        A grouped catalog that downstream normalization can flatten into odds
+        rows while preserving group identifiers and labels in metadata.
+    """
+
+    fixture: ParsedFixtureContext
+    requested_sportradar_id: str
+    event_id: str | None
+    game_id: str | int | None
+    total_market_size: int | None
+    groups: tuple[SportyBetMarketGroup, ...]
+
+    def iter_market_nodes(self) -> Iterator[tuple[SportyBetMarketGroup, Mapping[str, object]]]:
+        """Yield grouped market nodes in deterministic SportyBet source order."""
+
+        for market_group in self.groups:
+            for market_node in market_group.markets:
+                yield (market_group, market_node)
 
 
 class SportyBetAPIClient:
@@ -240,10 +287,13 @@ class SportyBetAPIClient:
 
             try:
                 event = self._extract_matching_event(payload, normalized_sportradar_id)
-                markets = self._parse_markets(
-                    event,
-                    sportradar_id=normalized_sportradar_id,
-                    fixture=fixture,
+                markets = self._tag_fetch_source(
+                    self._parse_markets(
+                        event,
+                        sportradar_id=normalized_sportradar_id,
+                        fixture=fixture,
+                    ),
+                    fetch_source="api",
                 )
             except ProviderError as exc:
                 errors.append(f"{url} -> {exc!s}")
@@ -334,6 +384,28 @@ class SportyBetAPIClient:
         headers["User-Agent"] = next(self._user_agents)
         return headers
 
+    @staticmethod
+    def _tag_fetch_source(
+        markets: Sequence[NormalizedOdds],
+        *,
+        fetch_source: str,
+    ) -> tuple[NormalizedOdds, ...]:
+        """Stamp the SportyBet fetch source onto normalized odds metadata."""
+
+        tagged_rows: list[NormalizedOdds] = []
+        for market in markets:
+            tagged_rows.append(
+                market.model_copy(
+                    update={
+                        "raw_metadata": {
+                            **market.raw_metadata,
+                            "sportybet_fetch_source": fetch_source,
+                        }
+                    }
+                )
+            )
+        return tuple(tagged_rows)
+
     def _extract_matching_event(
         self,
         payload: object,
@@ -394,18 +466,18 @@ class SportyBetAPIClient:
     ) -> tuple[NormalizedOdds, ...]:
         """Normalize all active outcomes from one SportyBet event payload."""
 
-        fixture_context = self._build_fixture_context(
+        event_catalog = self._build_event_catalog(
             event,
             sportradar_id=sportradar_id,
             fixture=fixture,
         )
         parsed_rows: list[NormalizedOdds] = []
-        for market_node in self._iter_market_nodes(event):
+        for market_group, market_node in event_catalog.iter_market_nodes():
             market_id = self._extract_market_id(market_node)
             provider_market_name = self._extract_market_name(market_node, market_id)
             market_specifier = self._extract_market_specifier(market_node)
             market = self._resolve_market_type(
-                sport=fixture_context.sport,
+                sport=event_catalog.fixture.sport,
                 market_id=market_id,
                 market_name=provider_market_name,
                 specifier=market_specifier,
@@ -424,7 +496,7 @@ class SportyBetAPIClient:
                     continue
 
                 normalized_row = NormalizedOdds(
-                    fixture_ref=fixture_context.fixture_ref,
+                    fixture_ref=event_catalog.fixture.fixture_ref,
                     market=market,
                     selection=self._normalize_selection_label(
                         provider_selection_name,
@@ -442,16 +514,72 @@ class SportyBetAPIClient:
                     raw_metadata=self._build_raw_metadata(
                         market_node=market_node,
                         outcome_node=outcome_node,
-                        competition=fixture_context.competition,
-                        home_team=fixture_context.home_team,
-                        away_team=fixture_context.away_team,
+                        competition=event_catalog.fixture.competition,
+                        home_team=event_catalog.fixture.home_team,
+                        away_team=event_catalog.fixture.away_team,
                         requested_sportradar_id=sportradar_id,
+                        event_id=event_catalog.event_id,
+                        game_id=event_catalog.game_id,
+                        total_market_size=event_catalog.total_market_size,
+                        market_group_id=market_group.group_id,
+                        market_group_name=market_group.group_name,
                     ),
                     last_updated=self._clock().astimezone(UTC),
                 )
                 parsed_rows.append(normalized_row)
 
         return tuple(parsed_rows)
+
+    def _build_event_catalog(
+        self,
+        event: Mapping[str, object],
+        *,
+        sportradar_id: str,
+        fixture: NormalizedFixture | None,
+    ) -> SportyBetEventCatalog:
+        """Arrange one SportyBet event payload into deterministic market groups."""
+
+        fixture_context = self._build_fixture_context(
+            event,
+            sportradar_id=sportradar_id,
+            fixture=fixture,
+        )
+        event_id = self._extract_optional_identifier(event, ("eventId", "matchId", "id"))
+        game_id = self._extract_optional_identifier(event, ("gameId",))
+        total_market_size = self._extract_optional_int(event, ("totalMarketSize",))
+
+        grouped_markets: dict[str, list[Mapping[str, object]]] = {}
+        group_names: dict[str, str] = {}
+        group_order: list[str] = []
+        ungrouped_index = 0
+
+        for market_node in self._iter_market_nodes(event):
+            group_id = self._extract_group_id(market_node)
+            if group_id is None:
+                ungrouped_index += 1
+                group_id = f"ungrouped:{ungrouped_index}"
+            group_name = self._extract_group_name(market_node) or "Ungrouped"
+            if group_id not in grouped_markets:
+                grouped_markets[group_id] = []
+                group_names[group_id] = group_name
+                group_order.append(group_id)
+            grouped_markets[group_id].append(market_node)
+
+        return SportyBetEventCatalog(
+            fixture=fixture_context,
+            requested_sportradar_id=sportradar_id,
+            event_id=event_id,
+            game_id=game_id,
+            total_market_size=total_market_size,
+            groups=tuple(
+                SportyBetMarketGroup(
+                    group_id=group_id,
+                    group_name=group_names[group_id],
+                    markets=tuple(grouped_markets[group_id]),
+                )
+                for group_id in group_order
+            ),
+        )
 
     def _build_fixture_context(
         self,
@@ -514,6 +642,32 @@ class SportyBetAPIClient:
                 for nested_market in market_node:
                     if isinstance(nested_market, Mapping):
                         yield nested_market
+
+    @staticmethod
+    def _extract_group_id(market_node: Mapping[str, object]) -> str | None:
+        """Return the stable SportyBet market-group identifier when present."""
+
+        for key in ("groupId", "marketGroupId"):
+            raw_value = market_node.get(key)
+            if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                return str(raw_value)
+            if isinstance(raw_value, str):
+                normalized = raw_value.strip()
+                if normalized:
+                    return normalized
+        return None
+
+    @staticmethod
+    def _extract_group_name(market_node: Mapping[str, object]) -> str | None:
+        """Return the SportyBet market-group label when present."""
+
+        for key in ("group", "groupName"):
+            raw_value = market_node.get(key)
+            if isinstance(raw_value, str):
+                normalized = raw_value.strip()
+                if normalized:
+                    return normalized
+        return None
 
     def _iter_outcome_nodes(
         self,
@@ -636,23 +790,24 @@ class SportyBetAPIClient:
 
     @staticmethod
     def _is_active_outcome(outcome_node: Mapping[str, object]) -> bool:
-        """Treat missing status as active while filtering explicit inactive outcomes."""
+        """Treat current SportyBet `isActive` flags as authoritative when present."""
 
-        raw_status = outcome_node.get("status")
-        if raw_status is None:
-            return True
-        if isinstance(raw_status, bool):
-            return raw_status
-        if isinstance(raw_status, int):
-            return raw_status in _ACTIVE_STATUSES
-        if isinstance(raw_status, str):
-            stripped = raw_status.strip().lower()
-            if stripped in {"active", "open", "enabled"}:
-                return True
-            if stripped in {"inactive", "suspended", "closed", "disabled"}:
-                return False
-            if stripped.isdigit():
-                return int(stripped) in _ACTIVE_STATUSES
+        for key in ("isActive", "status"):
+            raw_status = outcome_node.get(key)
+            if raw_status is None:
+                continue
+            if isinstance(raw_status, bool):
+                return raw_status
+            if isinstance(raw_status, int):
+                if key == "isActive":
+                    return raw_status == 1
+                return raw_status == 1
+            if isinstance(raw_status, str):
+                stripped = raw_status.strip().lower()
+                if stripped in {"1", "true", "active", "open", "enabled"}:
+                    return True
+                if stripped in {"0", "false", "inactive", "suspended", "closed", "disabled"}:
+                    return False
         return True
 
     def _resolve_market_type(
@@ -770,6 +925,11 @@ class SportyBetAPIClient:
         home_team: str,
         away_team: str,
         requested_sportradar_id: str,
+        event_id: str | None,
+        game_id: str | None,
+        total_market_size: int | None,
+        market_group_id: str,
+        market_group_name: str,
     ) -> dict[str, str | int | float | bool | None]:
         """Preserve SportyBet-native context that is useful for later resolution."""
 
@@ -778,12 +938,30 @@ class SportyBetAPIClient:
             "home_team": home_team,
             "away_team": away_team,
             "requested_sportradar_id": requested_sportradar_id,
+            "event_id": event_id,
+            "game_id": game_id,
+            "event_total_market_size": total_market_size,
+            "market_group_id": market_group_id,
+            "market_group_name": market_group_name,
         }
-        for key in ("specifier", "marketSpecifiers", "marketName", "name", "desc"):
+        for key in (
+            "specifier",
+            "marketSpecifiers",
+            "marketName",
+            "name",
+            "desc",
+            "group",
+            "groupId",
+            "title",
+            "product",
+            "sourceType",
+            "favourite",
+            "banned",
+        ):
             raw_value = market_node.get(key)
             if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
                 metadata[f"market_{key}"] = raw_value
-        for key in ("id", "outcomeId", "name", "desc", "status"):
+        for key in ("id", "outcomeId", "name", "desc", "status", "isActive"):
             raw_value = outcome_node.get(key)
             if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
                 metadata[f"outcome_{key}"] = raw_value
@@ -791,6 +969,19 @@ class SportyBetAPIClient:
 
     def _extract_competition_name(self, event: Mapping[str, object]) -> str:
         """Resolve the best available competition label from a SportyBet event."""
+
+        sport_node = event.get("sport")
+        if isinstance(sport_node, Mapping):
+            nested_category = sport_node.get("category")
+            if isinstance(nested_category, Mapping):
+                nested_tournament = nested_category.get("tournament")
+                if isinstance(nested_tournament, Mapping):
+                    tournament_name = self._extract_optional_text(nested_tournament, ("name",))
+                    if tournament_name is not None:
+                        return tournament_name
+                category_name = self._extract_optional_text(nested_category, ("name",))
+                if category_name is not None:
+                    return category_name
 
         tournament = event.get("category")
         if isinstance(tournament, Mapping):
@@ -861,6 +1052,42 @@ class SportyBetAPIClient:
         return None
 
     @staticmethod
+    def _extract_optional_identifier(
+        event: Mapping[str, object],
+        keys: Sequence[str],
+    ) -> str | int | None:
+        """Return the first non-blank text or integer identifier in a mapping."""
+
+        for key in keys:
+            raw_value = event.get(key)
+            if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, str):
+                normalized = raw_value.strip()
+                if normalized:
+                    return normalized
+        return None
+
+    @staticmethod
+    def _extract_optional_int(
+        event: Mapping[str, object],
+        keys: Sequence[str],
+    ) -> int | None:
+        """Return the first non-negative integer value present in a mapping."""
+
+        for key in keys:
+            raw_value = event.get(key)
+            if isinstance(raw_value, bool):
+                continue
+            if isinstance(raw_value, int):
+                return raw_value if raw_value >= 0 else None
+            if isinstance(raw_value, str):
+                normalized = raw_value.strip()
+                if normalized.isdigit():
+                    return int(normalized)
+        return None
+
+    @staticmethod
     def _normalize_sportradar_id(value: str) -> str:
         """Validate one outbound Sportradar identifier before any requests."""
 
@@ -902,5 +1129,7 @@ __all__ = [
     "SPORTYBET_MARKET_IDS",
     "SPORTYBET_RATE_LIMIT_POLICY",
     "SportyBetAPIClient",
+    "SportyBetEventCatalog",
     "SportyBetMarketCacheEntry",
+    "SportyBetMarketGroup",
 ]

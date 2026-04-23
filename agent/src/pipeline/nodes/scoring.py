@@ -26,7 +26,7 @@ _SCORING_FAILURE_PATTERN = re.compile(
     r"^Scoring failed for (?P<fixture>.+?): (?P<reason>.+)$"
 )
 _FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
     flags=re.IGNORECASE,
 )
 
@@ -118,8 +118,8 @@ def _fixture_team_stats(
         team_stats: Full state-level team-stat slate gathered during ingestion.
 
     Outputs:
-        A tuple of same-sport team snapshots, prioritizing rows that match the
-        fixture's team IDs or team names while preserving source order.
+        A tuple of same-sport team snapshots that exactly match the fixture's
+        team IDs or team names while preserving source order.
     """
 
     relevant_stats = tuple(stats for stats in team_stats if stats.sport == fixture.sport)
@@ -131,7 +131,7 @@ def _fixture_team_stats(
         for stats in relevant_stats
         if _team_stats_match_fixture_team(stats, fixture)
     )
-    return exact_matches or relevant_stats
+    return exact_matches
 
 
 def _team_stats_match_fixture_team(

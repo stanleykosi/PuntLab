@@ -14,12 +14,14 @@ from datetime import UTC, datetime
 
 from src.config import MarketType, SportName
 from src.providers.odds_mapping import (
+    build_fixture_market_snapshots,
     build_odds_market_catalog,
     filter_scoreable_odds,
     filter_unmapped_odds,
     group_markets_by_canonical_market,
     group_markets_by_fixture,
 )
+from src.schemas.fixtures import NormalizedFixture
 from src.schemas.odds import NormalizedOdds
 
 
@@ -328,3 +330,145 @@ def test_grouping_helpers_bucket_catalog_markets_by_fixture_and_canonical_market
         sport_by_fixture={"fixture-b": SportName.BASKETBALL},
     )
     assert scoreable_with_explicit_sport[-1].market == MarketType.MONEYLINE
+
+
+def test_build_fixture_market_snapshots_preserves_market_groups_and_total_size() -> None:
+    """Fixture snapshots should expose grouped full-market menus for prompt use."""
+
+    fixture = NormalizedFixture(
+        sportradar_id="sr:match:61301159",
+        home_team="Arsenal",
+        away_team="Chelsea",
+        competition="Premier League",
+        sport=SportName.SOCCER,
+        kickoff=datetime(2026, 4, 3, 19, 0, tzinfo=UTC),
+        source_provider="sportybet",
+        source_id="61301159",
+        country="England",
+    )
+    odds_rows = (
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Home",
+            odds=1.88,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Home",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Draw",
+            odds=3.40,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Draw",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Away",
+            odds=4.20,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Away",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Over 2.5",
+            odds=1.91,
+            provider="sportybet",
+            provider_market_name="Over/Under",
+            provider_selection_name="Over 2.5",
+            provider_market_id=18,
+            line=2.5,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1002",
+                "market_group_name": "Goals",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Under 2.5",
+            odds=1.89,
+            provider="sportybet",
+            provider_market_name="Over/Under",
+            provider_selection_name="Under 2.5",
+            provider_market_id=18,
+            line=2.5,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1002",
+                "market_group_name": "Goals",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+    )
+
+    catalog = build_odds_market_catalog(
+        odds_rows,
+        sport_by_fixture={fixture.get_fixture_ref(): fixture.sport},
+    )
+    snapshots = build_fixture_market_snapshots((fixture,), catalog)
+
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.fixture_ref == fixture.get_fixture_ref()
+    assert snapshot.total_market_size == 42
+    assert snapshot.reported_total_market_size == 42
+    assert snapshot.fetched_market_count == 2
+    assert snapshot.fetched_selection_count == 5
+    assert snapshot.scoreable_market_count == 2
+    assert snapshot.fetch_source == "api"
+    assert [group.group_name for group in snapshot.market_groups] == ["Main", "Goals"]
+    assert snapshot.market_groups[0].markets[0].canonical_markets == (MarketType.MATCH_RESULT,)
+    assert (
+        snapshot.market_groups[1].markets[0].selections[0].canonical_selection == "over"
+    )

@@ -1,9 +1,9 @@
 """External data provider integrations for PuntLab.
 
 Purpose: expose the canonical shared provider infrastructure and the concrete
-provider implementations that the ingestion stage composes.
-Scope: provider base classes plus the current API-Football, Football-Data.org,
-BALLDONTLIE, RSS feeds, Tavily, and The Odds API integrations.
+provider implementations that the ingestion stage still composes directly.
+Scope: provider base classes plus the current API-Football, BALLDONTLIE, RSS
+feeds, Tavily, and the orchestrator used by ingestion.
 Dependencies: concrete providers reuse `src.providers.base` and are
 orchestrated by the ingestion stage.
 """
@@ -19,7 +19,6 @@ from src.providers.base import (
     RateLimitPolicy,
     RetryConfig,
 )
-from src.providers.football_data import FootballDataProvider
 from src.providers.orchestrator import (
     CompetitionProviderRoute,
     InjuryFetchResult,
@@ -29,7 +28,6 @@ from src.providers.orchestrator import (
 )
 from src.providers.rss_feeds import DEFAULT_RSS_FEEDS, RSSFeedDefinition, RSSFeedProvider
 from src.providers.tavily_search import TavilySearchProvider
-from src.providers.the_odds_api import TheOddsAPIProvider
 
 __all__ = [
     "APIFootballProvider",
@@ -38,7 +36,6 @@ __all__ = [
     "CompetitionProviderRoute",
     "DataProvider",
     "DEFAULT_RSS_FEEDS",
-    "FootballDataProvider",
     "InjuryFetchResult",
     "OddsFetchResult",
     "ProviderError",
@@ -51,5 +48,4 @@ __all__ = [
     "RetryConfig",
     "StatsFetchResult",
     "TavilySearchProvider",
-    "TheOddsAPIProvider",
 ]

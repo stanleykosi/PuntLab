@@ -412,7 +412,8 @@ def _format_accumulator_message(slip: AccumulatorSlip) -> str:
     for leg in slip.legs:
         leg_lines.append(
             f"{leg.leg_number}. {leg.home_team} vs {leg.away_team}\n"
-            f"   {leg.market_label or leg.market.value}: {leg.selection} @ {leg.odds:.2f}"
+            f"   {leg.market_label or (leg.canonical_market.value if leg.canonical_market is not None else leg.market)}: "
+            f"{leg.selection} @ {leg.odds:.2f}"
         )
 
     rationale = ""

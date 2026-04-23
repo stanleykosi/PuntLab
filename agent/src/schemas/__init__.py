@@ -25,6 +25,13 @@ from src.schemas.analysis import (
     ScoringWeights,
 )
 from src.schemas.fixtures import FixtureStatus, NormalizedFixture
+from src.schemas.fixture_details import FixtureDetails, FixtureDetailSection
+from src.schemas.market_snapshot import (
+    FixtureMarketGroupSnapshot,
+    FixtureMarketSelection,
+    FixtureMarketSnapshot,
+    FixtureMarketSnapshotEntry,
+)
 from src.schemas.news import NewsArticle
 from src.schemas.odds import MarketType, NormalizedOdds
 from src.schemas.stats import InjuryData, InjuryType, PlayerStats, TeamStats
@@ -48,6 +55,12 @@ __all__ = [
     "DeliveryStatus",
     "ExplainedAccumulator",
     "FixtureStatus",
+    "FixtureDetailSection",
+    "FixtureDetails",
+    "FixtureMarketGroupSnapshot",
+    "FixtureMarketSelection",
+    "FixtureMarketSnapshot",
+    "FixtureMarketSnapshotEntry",
     "InjuryData",
     "InjuryType",
     "LegOutcome",

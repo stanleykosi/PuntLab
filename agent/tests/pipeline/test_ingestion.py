@@ -18,6 +18,7 @@ from src.pipeline.nodes.ingestion import ingestion_node
 from src.pipeline.state import PipelineStage, PipelineState
 from src.providers.odds_mapping import OddsMarketCatalog, build_odds_market_catalog
 from src.providers.orchestrator import (
+    FixtureDetailsFetchResult,
     InjuryFetchResult,
     OddsFetchResult,
     StatsFetchResult,
@@ -64,6 +65,7 @@ class StubProviderOrchestrator:
     fixtures: tuple[NormalizedFixture, ...]
     odds_result: OddsFetchResult
     stats_result: StatsFetchResult
+    fixture_details_result: FixtureDetailsFetchResult
     injuries_result: InjuryFetchResult
     news_articles: tuple[NewsArticle, ...]
 
@@ -102,6 +104,16 @@ class StubProviderOrchestrator:
         del fixtures, season_overrides, include_player_stats
         return self.stats_result
 
+    async def fetch_fixture_details(
+        self,
+        *,
+        fixtures: tuple[NormalizedFixture, ...],
+    ) -> FixtureDetailsFetchResult:
+        """Return the configured fixture-page detail bundle."""
+
+        del fixtures
+        return self.fixture_details_result
+
     async def fetch_injuries(
         self,
         *,
@@ -136,13 +148,13 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
                 market=None,
                 selection="Arsenal",
                 odds=1.92,
-                provider="the-odds-api",
+                provider="sportybet",
                 provider_market_name="Match Winner",
                 provider_selection_name="Arsenal",
                 period="match",
                 participant_scope="match",
                 raw_metadata={
-                    "sport_key": "soccer_epl",
+                    "sportybet_fetch_source": "api",
                     "home_team": "Arsenal",
                     "away_team": "Chelsea",
                 },
@@ -152,13 +164,13 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
                 market=None,
                 selection="Arsenal Over 1.5",
                 odds=2.20,
-                provider="the-odds-api",
+                provider="sportybet",
                 provider_market_name="Team Totals",
                 provider_selection_name="Arsenal Over 1.5",
                 line=1.5,
                 period="match",
                 participant_scope="team",
-                raw_metadata={"sport_key": "soccer_epl"},
+                raw_metadata={"sportybet_fetch_source": "api"},
             ),
         ),
         sport_by_fixture={fixture.get_fixture_ref(): fixture.sport},
@@ -190,7 +202,7 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
                 catalog=full_odds_catalog,
                 matched_rows=full_odds_catalog.all_rows(),
                 unmatched_fixture_refs=(),
-                providers_attempted=("the-odds-api",),
+                providers_attempted=("sportybet_api",),
             ),
             stats_result=StatsFetchResult(
                 team_stats=(
@@ -223,6 +235,10 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
                 ),
                 providers_attempted=("api-football",),
             ),
+            fixture_details_result=FixtureDetailsFetchResult(
+                fixture_details=(),
+                providers_attempted=("sportybet_fixture_stats",),
+            ),
             injuries_result=InjuryFetchResult(
                 injuries=(
                     InjuryData(
@@ -253,8 +269,9 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
         "Chelsea monitor late fitness concerns before derby",
     ]
     assert (
-        "Preserved unmapped odds markets remain outside the current canonical "
-        "scoring taxonomy."
+        "Preserved unmapped odds markets are available to research and "
+        "provider-native resolution, but they remain outside the deterministic "
+        "scoreable taxonomy."
     ) in result["errors"]
     assert result["errors"][0] == "Existing upstream notice."
 
@@ -271,14 +288,19 @@ async def test_ingestion_node_records_empty_fixture_and_provider_warnings() -> N
                 catalog=OddsMarketCatalog(),
                 matched_rows=(),
                 unmatched_fixture_refs=("sr:match:missing-1",),
-                providers_attempted=("the-odds-api",),
-                warnings=("The Odds API odds fetch failed: quota exhausted",),
+                providers_attempted=("sportybet_api",),
+                warnings=("SportyBet odds fetch failed for sr:match:missing-1: quota exhausted",),
             ),
             stats_result=StatsFetchResult(
                 team_stats=(),
                 player_stats=(),
                 providers_attempted=("api-football",),
                 warnings=("API-Football stats fetch failed for england_premier_league: timeout",),
+            ),
+            fixture_details_result=FixtureDetailsFetchResult(
+                fixture_details=(),
+                providers_attempted=("sportybet_fixture_stats",),
+                warnings=("SportyBet fixture details fetch failed for sr:match:7001: timeout",),
             ),
             injuries_result=InjuryFetchResult(
                 injuries=(),
@@ -296,8 +318,9 @@ async def test_ingestion_node_records_empty_fixture_and_provider_warnings() -> N
     assert result["errors"] == [
         "Existing upstream notice.",
         "No eligible fixtures were ingested for 2026-04-04.",
-        "The Odds API odds fetch failed: quota exhausted",
+        "SportyBet odds fetch failed for sr:match:missing-1: quota exhausted",
         "API-Football stats fetch failed for england_premier_league: timeout",
+        "SportyBet fixture details fetch failed for sr:match:7001: timeout",
         "API-Football injury fetch failed for england_premier_league: timeout",
         "Odds coverage is incomplete for fixtures: sr:match:missing-1",
     ]

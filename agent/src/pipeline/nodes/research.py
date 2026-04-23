@@ -26,8 +26,11 @@ from src.config import WAT_TIMEZONE, get_settings
 from src.llm import AllProvidersFailedError, MatchContext, get_llm, get_prompt
 from src.pipeline.state import PipelineStage, PipelineState
 from src.providers.base import ProviderError, RateLimitedClient
+from src.providers.odds_mapping import build_fixture_market_snapshots
 from src.providers.tavily_search import TavilySearchProvider
+from src.schemas.fixture_details import FixtureDetails
 from src.schemas.fixtures import NormalizedFixture
+from src.schemas.market_snapshot import FixtureMarketSelection, FixtureMarketSnapshot
 from src.schemas.news import NewsArticle
 from src.schemas.stats import InjuryData
 
@@ -35,6 +38,8 @@ DEFAULT_RESEARCH_BATCH_SIZE = 4
 MAX_CONTEXT_ARTICLES = 6
 MAX_TAVILY_RESULTS = 3
 MAX_ARTICLE_AGE_DAYS = 7
+MAX_FIXTURE_DETAIL_SECTION_LINES = 32
+MAX_FIXTURE_DETAIL_TOTAL_LINES = 180
 MIN_RELEVANCE_THRESHOLD = 0.20
 NEUTRAL_CONTEXT_SCORE = 0.5
 FALLBACK_SOURCE_LABEL = "PuntLab fallback"
@@ -45,7 +50,7 @@ _TAVILY_RESEARCH_FAILURE_PATTERN = re.compile(
     r"^Tavily research fetch failed for (?P<fixture>.+?): (?P<reason>.+)$"
 )
 _FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
     flags=re.IGNORECASE,
 )
 _REQUEST_ID_PATTERN = re.compile(
@@ -122,6 +127,16 @@ async def research_node(
             diagnostics.append(provider_diagnostic)
 
     try:
+        market_snapshots = build_fixture_market_snapshots(
+            validated_state.fixtures,
+            validated_state.odds_market_catalog,
+        )
+        market_snapshot_by_fixture = {
+            snapshot.fixture_ref: snapshot for snapshot in market_snapshots
+        }
+        fixture_details_by_fixture = {
+            details.fixture_ref: details for details in validated_state.fixture_details
+        }
         match_contexts: list[MatchContext] = []
         for fixture_batch in _iter_batches(validated_state.fixtures, batch_size):
             batch_results = await asyncio.gather(
@@ -130,6 +145,12 @@ async def research_node(
                         fixture=fixture,
                         state_news=validated_state.news_articles,
                         injuries=validated_state.injuries,
+                        market_snapshot=market_snapshot_by_fixture.get(
+                            fixture.get_fixture_ref()
+                        ),
+                        fixture_details=fixture_details_by_fixture.get(
+                            fixture.get_fixture_ref()
+                        ),
                         llm=resolved_llm,
                         tavily_provider=resolved_tavily,
                     )
@@ -158,6 +179,8 @@ async def _research_fixture(
     fixture: NormalizedFixture,
     state_news: Sequence[NewsArticle],
     injuries: Sequence[InjuryData],
+    market_snapshot: FixtureMarketSnapshot | None,
+    fixture_details: FixtureDetails | None,
     llm: BaseChatModel | None,
     tavily_provider: TavilySearchProvider | None,
 ) -> FixtureResearchResult:
@@ -212,6 +235,8 @@ async def _research_fixture(
         competition_context=_build_competition_context(fixture),
         kickoff_context=_build_kickoff_context(fixture),
         known_absences=_render_known_absences(fixture, fixture_injuries),
+        fixture_details=_render_fixture_details(fixture_details),
+        market_menu=_render_market_menu(market_snapshot),
         recent_news_bullets=_render_news_bullets(evidence_articles),
         source_labels=", ".join(source_labels),
     )
@@ -630,6 +655,93 @@ def _render_known_absences(
         summaries.append(f"Unassigned: {', '.join(grouped['unknown'][:4])}")
 
     return " | ".join(summaries)
+
+
+def _render_fixture_details(details: FixtureDetails | None) -> str:
+    """Render SportyBet fixture-page details compactly for one LLM prompt."""
+
+    if details is None or not details.sections:
+        return "No SportyBet fixture-page details were captured for this fixture."
+
+    lines = [
+        (
+            "SportyBet fixture-page coverage: "
+            f"{len(details.sections)} sections; widget loader {details.widget_loader_status}; "
+            f"fetched {details.fetched_at.isoformat()}."
+        )
+    ]
+    emitted_detail_lines = 0
+    for section in details.sections:
+        section_lines = section.content_lines[:MAX_FIXTURE_DETAIL_SECTION_LINES]
+        if not section_lines:
+            if section.status == "mounted":
+                continue
+            error = section.error_message or "no readable content"
+            lines.append(f"{section.widget_key}: {section.status} ({error}).")
+            continue
+
+        lines.append(f"{section.widget_key}:")
+        for content_line in section_lines:
+            if emitted_detail_lines >= MAX_FIXTURE_DETAIL_TOTAL_LINES:
+                lines.append("- Additional fixture-page lines omitted to keep prompt size bounded.")
+                return "\n".join(lines)
+            lines.append(f"- {content_line}")
+            emitted_detail_lines += 1
+
+        omitted_count = len(section.content_lines) - len(section_lines)
+        if omitted_count > 0:
+            lines.append(
+                f"- {omitted_count} additional {section.widget_key} lines omitted."
+            )
+
+    return "\n".join(lines)
+
+
+def _render_market_menu(snapshot: FixtureMarketSnapshot | None) -> str:
+    """Render one full fixture market menu in a compact prompt-friendly shape."""
+
+    if snapshot is None or snapshot.fetched_market_count == 0:
+        return "No SportyBet market snapshot was available for this fixture."
+
+    lines = [
+        (
+            "SportyBet market coverage: "
+            f"{snapshot.total_market_size} total markets "
+            + (
+                "(reported "
+                f"{snapshot.reported_total_market_size}, "
+                f"fetched {snapshot.fetched_market_count})"
+                if snapshot.reported_total_market_size is not None
+                else f"(fetched {snapshot.fetched_market_count})"
+            )
+            + f"; {snapshot.fetched_selection_count} active selections; "
+            f"{snapshot.scoreable_market_count} currently map into PuntLab's scoring taxonomy."
+        )
+    ]
+
+    for market_group in snapshot.market_groups:
+        lines.append(f"{market_group.group_name}:")
+        for market in market_group.markets:
+            lines.append(
+                f"- {market.market_label} [key={market.provider_market_key}]: "
+                + " | ".join(
+                    _format_market_selection_for_prompt(selection)
+                    for selection in market.selections
+                )
+            )
+
+    return "\n".join(lines)
+
+
+def _format_market_selection_for_prompt(selection: FixtureMarketSelection) -> str:
+    """Render one market selection as a compact odds token for prompt grounding."""
+
+    selection_label = selection.provider_selection_name
+    if selection.is_scoreable and selection.canonical_selection is not None:
+        selection_label += f" [{selection.canonical_selection}]"
+    if selection.line is not None and str(selection.line) not in selection_label:
+        selection_label += f" ({selection.line:g})"
+    return f"{selection_label} {selection.odds:.2f}"
 
 
 def _fixture_team_labels(fixture: NormalizedFixture) -> dict[str, str]:

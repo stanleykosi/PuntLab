@@ -18,8 +18,11 @@ from src.config import SportName
 from src.llm import AllProvidersFailedError, MatchContext
 from src.pipeline.nodes.research import research_node
 from src.pipeline.state import PipelineStage, PipelineState
+from src.providers.odds_mapping import build_odds_market_catalog
+from src.schemas.fixture_details import FixtureDetails, FixtureDetailSection
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.news import NewsArticle
+from src.schemas.odds import NormalizedOdds
 from src.schemas.stats import InjuryData, InjuryType
 
 
@@ -164,6 +167,8 @@ def build_state(
     *,
     fixtures: tuple[NormalizedFixture, ...],
     news_articles: tuple[NewsArticle, ...],
+    odds_rows: tuple[NormalizedOdds, ...] = (),
+    fixture_details: tuple[FixtureDetails, ...] = (),
 ) -> PipelineState:
     """Create a pipeline state containing fixture and news evidence."""
 
@@ -173,6 +178,11 @@ def build_state(
         started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
         current_stage=PipelineStage.RESEARCH,
         fixtures=list(fixtures),
+        odds_market_catalog=build_odds_market_catalog(
+            odds_rows,
+            sport_by_fixture={fixture.get_fixture_ref(): fixture.sport for fixture in fixtures},
+        ),
+        fixture_details=list(fixture_details),
         news_articles=list(news_articles),
         injuries=[
             InjuryData(
@@ -252,6 +262,165 @@ async def test_research_node_generates_match_contexts_with_tavily_enrichment() -
         "Chelsea prepare for derby pressure after midweek loss"
     )
     assert result["errors"] == ["Earlier-stage warning."]
+
+
+@pytest.mark.asyncio
+async def test_research_node_includes_full_market_menu_in_prompt_messages() -> None:
+    """The research prompt should include the fixture's grouped SportyBet market menu."""
+
+    fixture = build_fixture(
+        sportradar_id="sr:match:7001",
+        home_team="Arsenal",
+        away_team="Chelsea",
+    )
+    state_article = build_article(
+        headline="Arsenal carry strong home form into London clash",
+        source="BBC Sport",
+        url="https://example.com/arsenal-home-form",
+        fixture_ref=fixture.get_fixture_ref(),
+        teams=("Arsenal", "Chelsea"),
+    )
+    llm_runner = FakeStructuredLLM(
+        MatchContext(
+            fixture_ref=None,
+            morale_home=0.72,
+            morale_away=0.44,
+            rivalry_factor=0.63,
+            pressure_home=0.41,
+            pressure_away=0.71,
+            key_narrative="Arsenal look steadier while Chelsea arrive under more pressure.",
+            qualitative_score=0.69,
+            data_sources=("ignored-by-node",),
+            news_summary=None,
+        )
+    )
+    llm = FakeLLM(llm_runner)
+    odds_rows = (
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Home",
+            odds=1.83,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Home",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": fixture.home_team,
+                "away_team": fixture.away_team,
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Draw",
+            odds=3.50,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Draw",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": fixture.home_team,
+                "away_team": fixture.away_team,
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+        NormalizedOdds(
+            fixture_ref=fixture.get_fixture_ref(),
+            market=None,
+            selection="Away",
+            odds=4.20,
+            provider="sportybet",
+            provider_market_name="1X2",
+            provider_selection_name="Away",
+            provider_market_id=1,
+            period="match",
+            participant_scope="match",
+            raw_metadata={
+                "home_team": fixture.home_team,
+                "away_team": fixture.away_team,
+                "event_id": fixture.get_fixture_ref(),
+                "market_group_id": "1001",
+                "market_group_name": "Main",
+                "event_total_market_size": 42,
+                "sportybet_fetch_source": "api",
+            },
+        ),
+    )
+    fixture_details = FixtureDetails(
+        fixture_ref=fixture.get_fixture_ref(),
+        fixture_url=(
+            "https://www.sportybet.com/ng/sport/football/england/premier_league/"
+            "Arsenal_vs_Chelsea/sr:match:7001"
+        ),
+        event_id=fixture.get_fixture_ref(),
+        match_id="7001",
+        fetched_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+        widget_loader_status="loaded",
+        sections=(
+            FixtureDetailSection(
+                widget_key="teamInfo",
+                widget_type="team.info",
+                status="mounted",
+                content_lines=(
+                    "Home manager: Mikel Arteta",
+                    "Away manager: Enzo Maresca",
+                ),
+                response_urls=(
+                    "https://widgets.fn.sportradar.com/common/en/Etc:UTC/gismo/stats_team_info/1",
+                ),
+            ),
+            FixtureDetailSection(
+                widget_key="preview",
+                widget_type="match.preview",
+                status="mounted",
+                content_lines=("Arsenal form: WWDWW",),
+            ),
+        ),
+    )
+
+    await research_node(
+        build_state(
+            fixtures=(fixture,),
+            news_articles=(state_article,),
+            odds_rows=odds_rows,
+            fixture_details=(fixture_details,),
+        ),
+        llm=llm,  # type: ignore[arg-type]
+        tavily_provider=StubTavilyProvider(
+            results_by_fixture={},
+            requested_fixture_refs=[],
+        ),  # type: ignore[arg-type]
+        batch_size=1,
+    )
+
+    prompt_messages = llm_runner.invocations[0]
+    rendered_prompt = "\n".join(
+        getattr(message, "content", str(message))
+        for message in prompt_messages
+    )
+    assert "SportyBet market coverage: 42 total markets" in rendered_prompt
+    assert "SportyBet fixture-page coverage: 2 sections" in rendered_prompt
+    assert "Home manager: Mikel Arteta" in rendered_prompt
+    assert "Arsenal form: WWDWW" in rendered_prompt
+    assert "Main:" in rendered_prompt
+    assert (
+        "- 1X2 [key=1x2]: Home [home] 1.83 | Draw [draw] 3.50 | Away [away] 4.20"
+        in rendered_prompt
+    )
 
 
 @pytest.mark.asyncio

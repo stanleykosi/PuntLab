@@ -151,8 +151,6 @@ class DataProviderConfig(BaseModel):
     """Grouped sports data provider credentials used by ingestion."""
 
     api_football_key: str | None
-    football_data_api_key: str | None
-    the_odds_api_key: str | None
     balldontlie_api_key: str | None
     tavily_api_key: str | None
 
@@ -513,8 +511,6 @@ class Settings(BaseSettings):
     )
 
     api_football_key: str | None = Field(default=None, alias="API_FOOTBALL_KEY")
-    football_data_api_key: str | None = Field(default=None, alias="FOOTBALL_DATA_API_KEY")
-    the_odds_api_key: str | None = Field(default=None, alias="THE_ODDS_API_KEY")
     balldontlie_api_key: str | None = Field(default=None, alias="BALLDONTLIE_API_KEY")
     tavily_api_key: str | None = Field(default=None, alias="TAVILY_API_KEY")
 
@@ -566,8 +562,6 @@ class Settings(BaseSettings):
         "anthropic_api_key",
         "openrouter_api_key",
         "api_football_key",
-        "football_data_api_key",
-        "the_odds_api_key",
         "balldontlie_api_key",
         "tavily_api_key",
         "supabase_url",
@@ -669,8 +663,6 @@ class Settings(BaseSettings):
 
         return DataProviderConfig(
             api_football_key=self.api_football_key,
-            football_data_api_key=self.football_data_api_key,
-            the_odds_api_key=self.the_odds_api_key,
             balldontlie_api_key=self.balldontlie_api_key,
             tavily_api_key=self.tavily_api_key,
         )

@@ -11,6 +11,7 @@ schemas, and the canonical scoring weights exported from `src.scoring.weights`.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isclose
@@ -120,8 +121,11 @@ class _CandidateRecommendation:
         to rank candidate recommendations.
     """
 
-    market: MarketType
+    market_key: str
+    market_label: str
+    canonical_market: MarketType | None
     selection: str
+    canonical_selection: str | None
     line: float | None
     rows: tuple[NormalizedOdds, ...]
     representative_row: NormalizedOdds
@@ -191,8 +195,6 @@ class ScoringEngine:
         Raises:
             TypeError: If the fixture is not canonical or the team stats are not
                 canonical `TeamStats` rows.
-            ValueError: If the fixture teams cannot be matched to any supplied
-                team-stat snapshots.
         """
 
         if not isinstance(fixture, NormalizedFixture):
@@ -202,8 +204,16 @@ class ScoringEngine:
         relevant_odds = self._relevant_odds_for_fixture(fixture, odds)
         scoreable_odds = self._scoreable_odds_for_fixture(relevant_odds, fixture)
 
-        form_score = analyze_form(matched_team_stats.relevant)
-        venue_score = analyze_venue(fixture, matched_team_stats.relevant)
+        form_score = (
+            analyze_form(matched_team_stats.relevant)
+            if matched_team_stats.relevant
+            else 0.5
+        )
+        venue_score = (
+            analyze_venue(fixture, matched_team_stats.relevant)
+            if matched_team_stats.relevant
+            else 0.5
+        )
         h2h_score = self._calculate_h2h_score(fixture, h2h_data)
         injury_score = self._calculate_injury_score(injuries)
         odds_value_score = self._calculate_odds_value_score(relevant_odds)
@@ -226,6 +236,7 @@ class ScoringEngine:
         recommendation = self._select_best_candidate(
             fixture=fixture,
             matched_team_stats=matched_team_stats,
+            relevant_odds=relevant_odds,
             scoreable_odds=scoreable_odds,
             context=context,
             injuries=injuries or (),
@@ -258,13 +269,22 @@ class ScoringEngine:
             composite_score=composite_score,
             confidence=confidence,
             factors=factors,
-            recommended_market=recommendation.market if recommendation is not None else None,
+            recommended_market=(
+                recommendation.market_key if recommendation is not None else None
+            ),
+            recommended_market_label=(
+                recommendation.market_label if recommendation is not None else None
+            ),
+            recommended_canonical_market=(
+                recommendation.canonical_market if recommendation is not None else None
+            ),
             recommended_selection=(
                 recommendation.selection if recommendation is not None else None
             ),
             recommended_odds=(
                 recommendation.recommended_odds if recommendation is not None else None
             ),
+            recommended_line=(recommendation.line if recommendation is not None else None),
             qualitative_summary=self._build_qualitative_summary(context),
         )
 
@@ -306,12 +326,13 @@ class ScoringEngine:
         context: MatchContext | None = None,
         injuries: Sequence[InjuryData] | None = None,
         composite_score: float = 0.5,
-    ) -> MarketType | None:
-        """Return the best-fit market family from the scoreable odds subset."""
+    ) -> str | None:
+        """Return the best-fit provider market key from the odds subset."""
 
         candidate = self._select_best_candidate(
             fixture=fixture,
             matched_team_stats=self._resolve_team_stats(fixture, team_stats),
+            relevant_odds=self._relevant_odds_for_fixture(fixture, odds),
             scoreable_odds=self._scoreable_odds_for_fixture(
                 self._relevant_odds_for_fixture(fixture, odds),
                 fixture,
@@ -320,7 +341,7 @@ class ScoringEngine:
             injuries=injuries or (),
             composite_score=composite_score,
         )
-        return candidate.market if candidate is not None else None
+        return candidate.market_key if candidate is not None else None
 
     def select_best_selection(
         self,
@@ -337,6 +358,7 @@ class ScoringEngine:
         candidate = self._select_best_candidate(
             fixture=fixture,
             matched_team_stats=self._resolve_team_stats(fixture, team_stats),
+            relevant_odds=self._relevant_odds_for_fixture(fixture, odds),
             scoreable_odds=self._scoreable_odds_for_fixture(
                 self._relevant_odds_for_fixture(fixture, odds),
                 fixture,
@@ -369,9 +391,6 @@ class ScoringEngine:
         """Match the richest home and away team snapshots to the fixture."""
 
         normalized_team_stats = tuple(team_stats)
-        if not normalized_team_stats:
-            raise ValueError("calculate_match_score requires at least one TeamStats record.")
-
         for stats in normalized_team_stats:
             if not isinstance(stats, TeamStats):
                 raise TypeError("calculate_match_score expects TeamStats instances only.")
@@ -395,11 +414,6 @@ class ScoringEngine:
             for stats in (home_stats, away_stats)
             if stats is not None
         )
-        if not relevant:
-            raise ValueError(
-                "calculate_match_score could not match any TeamStats records to the fixture."
-            )
-
         return _ResolvedTeamStats(home=home_stats, away=away_stats, relevant=relevant)
 
     def _relevant_odds_for_fixture(
@@ -492,7 +506,11 @@ class ScoringEngine:
         """Estimate how complete the supporting data set is for confidence."""
 
         components = (
-            1.0 if len(matched_team_stats.relevant) == 2 else 0.65,
+            (
+                1.0
+                if len(matched_team_stats.relevant) == 2
+                else 0.65 if len(matched_team_stats.relevant) == 1 else 0.0
+            ),
             1.0 if scoreable_odds else 0.30 if relevant_odds else 0.0,
             1.0 if context is not None else 0.0,
             1.0 if injuries is not None else 0.0,
@@ -524,6 +542,7 @@ class ScoringEngine:
         *,
         fixture: NormalizedFixture,
         matched_team_stats: _ResolvedTeamStats,
+        relevant_odds: Sequence[NormalizedOdds],
         scoreable_odds: Sequence[NormalizedOdds],
         context: MatchContext | None,
         injuries: Sequence[InjuryData],
@@ -531,15 +550,27 @@ class ScoringEngine:
     ) -> _CandidateRecommendation | None:
         """Select the best recommendation candidate from grouped odds rows."""
 
-        if not scoreable_odds:
-            return None
-
         insights = self._build_fixture_insights(
             fixture=fixture,
             matched_team_stats=matched_team_stats,
             context=context,
             injuries=injuries,
         )
+        context_candidate = self._build_context_suggested_candidate(
+            relevant_odds=relevant_odds,
+            context=context,
+            insights=insights,
+            composite_score=composite_score,
+        )
+        if context_candidate is not None:
+            return context_candidate
+
+        if not matched_team_stats.relevant:
+            return None
+
+        if not scoreable_odds:
+            return None
+
         grouped_candidates = self._group_candidate_rows(scoreable_odds)
         recommendation_candidates: list[_CandidateRecommendation] = []
 
@@ -557,8 +588,14 @@ class ScoringEngine:
             provider_count = len({row.provider.casefold() for row in rows})
 
             candidate = _CandidateRecommendation(
-                market=representative_row.market,
-                selection=representative_row.selection,
+                market_key=(
+                    representative_row.provider_market_key
+                    or representative_row.market.value
+                ),
+                market_label=representative_row.market_label or representative_row.provider_market_name,
+                canonical_market=representative_row.market,
+                selection=representative_row.provider_selection_name,
+                canonical_selection=representative_row.selection,
                 line=representative_row.line,
                 rows=rows,
                 representative_row=representative_row,
@@ -600,6 +637,83 @@ class ScoringEngine:
             )
             grouped.setdefault(group_key, []).append(row)
         return {key: tuple(rows) for key, rows in grouped.items()}
+
+    def _build_context_suggested_candidate(
+        self,
+        *,
+        relevant_odds: Sequence[NormalizedOdds],
+        context: MatchContext | None,
+        insights: _FixtureInsights,
+        composite_score: float,
+    ) -> _CandidateRecommendation | None:
+        """Build a recommendation from the research model's exact market suggestion."""
+
+        if (
+            context is None
+            or context.suggested_market is None
+            or context.suggested_selection is None
+        ):
+            return None
+
+        normalized_market_key = self._normalize_key(context.suggested_market)
+        normalized_selection_key = self._normalize_key(context.suggested_selection)
+        matching_rows = tuple(
+            row
+            for row in relevant_odds
+            if (
+                (row.provider_market_key or self._normalize_key(row.provider_market_name))
+                == normalized_market_key
+            )
+            and (
+                row.provider_selection_key == normalized_selection_key
+                or self._normalize_key(row.selection) == normalized_selection_key
+            )
+            and (
+                context.suggested_line is None
+                or row.line is None
+                or isclose(row.line, context.suggested_line, abs_tol=0.001)
+            )
+        )
+        if not matching_rows:
+            return None
+
+        representative_row = min(
+            matching_rows,
+            key=lambda row: (
+                abs(row.odds - context.suggested_odds)
+                if context.suggested_odds is not None
+                else 0.0,
+                -row.odds,
+            ),
+        )
+        canonical_market = representative_row.market
+        fit_score = (
+            self._score_market_fit(
+                market=canonical_market,
+                selection=representative_row.selection,
+                line=representative_row.line,
+                insights=insights,
+            )
+            if canonical_market is not None
+            else _clamp((composite_score * 0.60) + ((context.qualitative_score) * 0.40))
+        )
+
+        return _CandidateRecommendation(
+            market_key=representative_row.provider_market_key or normalized_market_key,
+            market_label=representative_row.market_label or representative_row.provider_market_name,
+            canonical_market=canonical_market,
+            selection=representative_row.provider_selection_name,
+            canonical_selection=(
+                representative_row.selection if canonical_market is not None else None
+            ),
+            line=representative_row.line,
+            rows=matching_rows,
+            representative_row=representative_row,
+            recommended_odds=representative_row.odds,
+            fit_score=fit_score,
+            agreement_score=self._calculate_candidate_agreement(matching_rows),
+            provider_count=len({row.provider.casefold() for row in matching_rows}),
+        )
 
     def _build_fixture_insights(
         self,
@@ -667,7 +781,7 @@ class ScoringEngine:
             (candidate.recommended_odds - consensus_odds) / max(consensus_odds, 1.0)
         )
         provider_coverage = _clamp(candidate.provider_count / 3.0)
-        complexity = self._market_complexity_score(candidate.market)
+        complexity = self._market_complexity_score(candidate.canonical_market)
         return (
             (candidate.fit_score * 0.50)
             + (composite_score * 0.25)
@@ -1072,9 +1186,11 @@ class ScoringEngine:
             (away_burden - home_burden) / max(home_burden + away_burden, 1.0)
         )
 
-    def _market_complexity_score(self, market: MarketType) -> float:
+    def _market_complexity_score(self, market: MarketType | None) -> float:
         """Favor simpler markets over highly specific ones by default."""
 
+        if market is None:
+            return 0.60
         if market in _LOW_COMPLEXITY_MARKETS:
             return 1.0
         if market in _MEDIUM_COMPLEXITY_MARKETS:
@@ -1091,6 +1207,12 @@ class ScoringEngine:
         if context is None:
             return None
         return context.news_summary or context.key_narrative
+
+    @staticmethod
+    def _normalize_key(value: str) -> str:
+        """Convert free-form provider labels into stable comparison keys."""
+
+        return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
 
     def _select_best_team_snapshot(
         self,

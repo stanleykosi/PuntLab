@@ -14,14 +14,15 @@ from src.scrapers.sportybet_api import (
     SPORTYBET_MARKET_IDS,
     SPORTYBET_RATE_LIMIT_POLICY,
     SportyBetAPIClient,
+    SportyBetEventCatalog,
     SportyBetMarketCacheEntry,
+    SportyBetMarketGroup,
 )
 from src.scrapers.sportybet_browser import (
     DEFAULT_MARKET_WAIT_SELECTORS,
     DOM_MARKET_EXTRACTOR_SCRIPT,
     SportyBetBrowserScraper,
 )
-
 __all__ = [
     "DEFAULT_USER_AGENTS",
     "DEFAULT_MARKET_WAIT_SELECTORS",
@@ -33,6 +34,8 @@ __all__ = [
     "SPORTYBET_MARKET_IDS",
     "SPORTYBET_RATE_LIMIT_POLICY",
     "SportyBetAPIClient",
+    "SportyBetEventCatalog",
     "SportyBetBrowserScraper",
     "SportyBetMarketCacheEntry",
+    "SportyBetMarketGroup",
 ]

@@ -32,7 +32,8 @@ async def ranking_node(state: PipelineState | Mapping[str, Any]) -> dict[str, ob
     validated_state = (
         state if isinstance(state, PipelineState) else PipelineState.model_validate(state)
     )
-    ordered_scores = _order_match_scores(validated_state.match_scores)
+    actionable_scores = _actionable_match_scores(validated_state.match_scores)
+    ordered_scores = _order_match_scores(actionable_scores)
     ranked_matches = [
         RankedMatch.model_validate(
             {
@@ -43,11 +44,36 @@ async def ranking_node(state: PipelineState | Mapping[str, Any]) -> dict[str, ob
         for rank, score in enumerate(ordered_scores, start=1)
     ]
 
+    diagnostics: list[str] = list(validated_state.errors)
+    skipped_count = len(validated_state.match_scores) - len(actionable_scores)
+    if skipped_count > 0:
+        skipped_noun = "fixture" if skipped_count == 1 else "fixtures"
+        diagnostics = _merge_diagnostics(
+            diagnostics,
+            (
+                f"Ranking skipped {skipped_count} scored {skipped_noun} without a "
+                "recommended market selection.",
+            ),
+        )
+
     return {
         "current_stage": PipelineStage.MARKET_RESOLUTION,
         "ranked_matches": ranked_matches,
-        "errors": list(validated_state.errors),
+        "errors": diagnostics,
     }
+
+
+def _actionable_match_scores(match_scores: Sequence[MatchScore]) -> list[MatchScore]:
+    """Return only scored fixtures that contain a concrete market recommendation."""
+
+    actionable_scores: list[MatchScore] = []
+    for score in match_scores:
+        if not isinstance(score, MatchScore):
+            raise TypeError("ranking_node expects MatchScore instances only.")
+        if score.recommended_market is None or score.recommended_selection is None:
+            continue
+        actionable_scores.append(score)
+    return actionable_scores
 
 
 def _order_match_scores(match_scores: Sequence[MatchScore]) -> list[MatchScore]:
@@ -65,15 +91,27 @@ def _order_match_scores(match_scores: Sequence[MatchScore]) -> list[MatchScore]:
         TypeError: If any supplied item is not a canonical `MatchScore`.
     """
 
-    normalized_scores = list(match_scores)
-    for score in normalized_scores:
-        if not isinstance(score, MatchScore):
-            raise TypeError("ranking_node expects MatchScore instances only.")
-
     # Deterministic tie-breakers keep downstream slips stable when fixtures
     # land on the same model score and confidence.
-    normalized_scores.sort(key=_ranking_sort_key)
-    return normalized_scores
+    ordered_scores = list(match_scores)
+    ordered_scores.sort(key=_ranking_sort_key)
+    return ordered_scores
+
+
+def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str]) -> list[str]:
+    """Append new diagnostics to the error list without duplicate messages."""
+
+    merged_errors = list(existing_errors)
+    seen_messages = {message.casefold() for message in merged_errors}
+
+    for diagnostic in diagnostics:
+        lookup_key = diagnostic.casefold()
+        if lookup_key in seen_messages:
+            continue
+        seen_messages.add(lookup_key)
+        merged_errors.append(diagnostic)
+
+    return merged_errors
 
 
 def _ranking_sort_key(score: MatchScore) -> tuple[float, float, str, str, str, str]:

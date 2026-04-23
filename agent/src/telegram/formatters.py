@@ -83,7 +83,12 @@ def format_accumulator_message(
 
     for leg in slip.legs:
         sport_emoji = _SPORT_EMOJIS.get(leg.sport, "🎯")
-        market_label = _format_market_label(leg.market, leg.market_label, leg.line)
+        market_label = _format_market_label(
+            leg.market,
+            leg.canonical_market,
+            leg.market_label,
+            leg.line,
+        )
         lines.extend(
             (
                 "",
@@ -250,29 +255,30 @@ def format_welcome_message(
 
 
 def _format_market_label(
-    market: MarketType,
+    market: str,
+    canonical_market: MarketType | None,
     market_label: str | None,
     line: float | None,
 ) -> str:
     """Build a concise market display label for one accumulator leg."""
 
-    base_label = market_label or _normalize_market_name(market)
+    base_label = market_label or _normalize_market_name(market, canonical_market)
     selection_suffix = ""
     if line is not None:
         selection_suffix = f" (line {line:+.1f})"
     return f"{base_label}{selection_suffix}"
 
 
-def _normalize_market_name(market: MarketType) -> str:
-    """Convert canonical market enum values into readable labels."""
+def _normalize_market_name(market: str, canonical_market: MarketType | None) -> str:
+    """Convert canonical or provider-native market keys into readable labels."""
 
-    normalized = market.value.replace("_", " ")
-    if market is MarketType.MATCH_RESULT:
+    if canonical_market is MarketType.MATCH_RESULT:
         return "Match Result (1X2)"
-    if market is MarketType.BTTS:
+    if canonical_market is MarketType.BTTS:
         return "Both Teams To Score"
-    if market.value.startswith("over_under_"):
+    if canonical_market is not None and canonical_market.value.startswith("over_under_"):
         return "Over/Under Goals"
+    normalized = market.replace("_", " ").replace("-", " ")
     return normalized.title()
 
 

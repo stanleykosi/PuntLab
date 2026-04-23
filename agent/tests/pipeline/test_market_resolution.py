@@ -1,8 +1,8 @@
 """Tests for PuntLab's market-resolution pipeline node.
 
 Purpose: verify that ranked matches are resolved into sportsbook-ready market
-rows using the full preserved odds catalog while fixture-level failures remain
-recoverable.
+rows using the prefetched SportyBet catalog while fixture-level failures
+remain recoverable.
 Scope: unit tests for `src.pipeline.nodes.market_resolution`.
 Dependencies: pytest plus lightweight resolver stubs and the canonical
 pipeline-state, fixture, ranking, and resolved-market schemas.
@@ -86,11 +86,11 @@ def build_catalog_row(
     fixture: NormalizedFixture,
     market: MarketType,
     selection: str,
-    provider: str = "the-odds-api",
-    provider_market_name: str = "Match Winner",
+    provider: str = "sportybet",
+    provider_market_name: str = "Full Time Result",
     line: float | None = None,
 ) -> NormalizedOdds:
-    """Create one preserved odds row used to verify node fallback inputs."""
+    """Create one preserved SportyBet row used to verify node inputs."""
 
     return NormalizedOdds(
         fixture_ref=fixture.get_fixture_ref(),
@@ -107,6 +107,7 @@ def build_catalog_row(
             "home_team": fixture.home_team,
             "away_team": fixture.away_team,
             "sportradar_id": fixture.sportradar_id,
+            "sportybet_fetch_source": "api",
         },
         last_updated=datetime(2026, 4, 5, 8, 0, tzinfo=UTC),
     )
@@ -159,13 +160,13 @@ class StubMarketResolver:
         fixture: NormalizedFixture,
         analysis: RankedMatch,
         *,
-        external_odds: tuple[NormalizedOdds, ...] = (),
+        prefetched_rows: tuple[NormalizedOdds, ...] = (),
         use_cache: bool = True,
     ) -> ResolvedMarket:
         """Return the configured resolution result or raise a configured error."""
 
         del use_cache
-        self.resolve_calls.append((analysis.fixture_ref, external_odds))
+        self.resolve_calls.append((analysis.fixture_ref, prefetched_rows))
         error = self._errors_by_fixture.get(analysis.fixture_ref)
         if error is not None:
             raise error
@@ -370,7 +371,7 @@ async def test_market_resolution_node_groups_repeated_failures_by_reason() -> No
 
 @pytest.mark.asyncio
 async def test_market_resolution_node_skips_ranked_matches_without_recommendation() -> None:
-    """Ranked matches without a canonical recommendation should be skipped early."""
+    """Ranked matches without a recommendation should be skipped early."""
 
     fixture = build_fixture(
         sportradar_id="sr:match:7301",
@@ -402,14 +403,14 @@ async def test_market_resolution_node_skips_ranked_matches_without_recommendatio
     assert result["errors"] == [
         (
             "Market resolution skipped for sr:match:7301: "
-            "ranked match lacks a canonical recommended market and selection."
+            "ranked match lacks a recommended market and selection."
         )
     ]
     assert resolver.resolve_calls == []
 
 
 @pytest.mark.asyncio
-async def test_market_resolution_node_normalizes_verbose_external_odds_failures() -> None:
+async def test_market_resolution_node_normalizes_verbose_sportybet_failures() -> None:
     """Fixture-specific resolver detail should collapse into one grouped root cause."""
 
     failed_fixture_one = build_fixture(
@@ -428,8 +429,8 @@ async def test_market_resolution_node_normalizes_verbose_external_odds_failures(
         "Could not resolve a bookmaker market for fixture sr:match:placeholder "
         "(Team A vs Team B). Recommended market: `match_result`. "
         "Recommended selection: `home`. Diagnostics: SportyBet resolution was skipped because "
-        "fixture.sportradar_id is missing. | External odds fallback did not contain a compatible "
-        "canonical market for the fixture."
+        "fixture.sportradar_id is missing. | No SportyBet source produced a compatible "
+        "market for the fixture."
     )
     resolver = StubMarketResolver(
         resolved_by_fixture={},
@@ -447,7 +448,7 @@ async def test_market_resolution_node_normalizes_verbose_external_odds_failures(
 
     result = await market_resolution_node(
         PipelineState(
-            run_id="run-2026-04-05-grouped-external-odds",
+            run_id="run-2026-04-05-grouped-sportybet",
             run_date=date(2026, 4, 5),
             started_at=datetime(2026, 4, 5, 9, 30, tzinfo=UTC),
             current_stage=PipelineStage.MARKET_RESOLUTION,
@@ -464,7 +465,7 @@ async def test_market_resolution_node_normalizes_verbose_external_odds_failures(
     assert result["errors"] == [
         (
             "Market resolution failed for 2 fixtures due to: "
-            "[market-resolver] no compatible canonical odds were found for the recommended "
+            "[market-resolver] no compatible SportyBet odds were found for the recommended "
             "market and selection. "
             "Sample fixtures: sr:match:7401, sr:match:7402."
         )

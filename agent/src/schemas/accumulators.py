@@ -11,6 +11,7 @@ contracts from `src.schemas.odds`, and common validation helpers.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import date, datetime
 from enum import StrEnum
 from math import isclose, prod
@@ -40,7 +41,6 @@ class ResolutionSource(StrEnum):
 
     SPORTYBET_API = "sportybet_api"
     SPORTYBET_BROWSER = "sportybet_browser"
-    EXTERNAL_ODDS = "external_odds"
 
 
 class AccumulatorStrategy(StrEnum):
@@ -82,15 +82,19 @@ class ResolvedMarket(NormalizedOdds):
     """Best available market selected for a fixture after resolution.
 
     Inputs:
-        A normalized odds row chosen from SportyBet or an external fallback.
+        A normalized odds row chosen from the canonical SportyBet sources.
 
     Outputs:
         A resolved market enriched with resolution metadata for downstream leg
         assembly and observability.
     """
 
-    market: MarketType = Field(
-        description="Canonical market taxonomy selected by the resolver for downstream use."
+    market: str = Field(
+        description="Provider-native market key selected by the resolver for downstream use."
+    )
+    canonical_market: MarketType | None = Field(
+        default=None,
+        description="Canonical market hint when the resolved market maps into PuntLab taxonomy.",
     )
     resolution_source: ResolutionSource = Field(
         description="Resolver path that produced this market."
@@ -112,7 +116,7 @@ class ResolvedMarket(NormalizedOdds):
         description="Timezone-aware timestamp for when resolution completed.",
     )
 
-    @field_validator("competition", "home_team", "away_team")
+    @field_validator("market", "competition", "home_team", "away_team")
     @classmethod
     def validate_required_text(cls, value: str, info: object) -> str:
         """Reject blank fixture display fields after trimming."""
@@ -133,6 +137,9 @@ class ResolvedMarket(NormalizedOdds):
     def validate_fixture_identity(self) -> Self:
         """Reject impossible resolved-market fixture metadata."""
 
+        if self.canonical_market is None:
+            with suppress(ValueError):
+                self.canonical_market = MarketType(self.market)
         if self.home_team.casefold() == self.away_team.casefold():
             raise ValueError("home_team and away_team must describe different teams.")
         return self
@@ -157,7 +164,11 @@ class AccumulatorLeg(BaseModel):
     competition: str = Field(description="Competition display name.")
     home_team: str = Field(description="Home team display name.")
     away_team: str = Field(description="Away team display name.")
-    market: MarketType = Field(description="Canonical market taxonomy for the leg.")
+    market: str = Field(description="Provider-native market key for the leg.")
+    canonical_market: MarketType | None = Field(
+        default=None,
+        description="Canonical market hint when the leg maps into PuntLab taxonomy.",
+    )
     selection: str = Field(description="Human-readable selection within the chosen market.")
     odds: float = Field(gt=1.0, description="Decimal odds for the chosen leg.")
     provider: str = Field(description="Provider label backing the chosen odds.")
@@ -195,6 +206,7 @@ class AccumulatorLeg(BaseModel):
         "competition",
         "home_team",
         "away_team",
+        "market",
         "selection",
         "provider",
     )
@@ -226,10 +238,15 @@ class AccumulatorLeg(BaseModel):
     def validate_leg_shape(self) -> Self:
         """Enforce canonical line-market handling and distinct fixture teams."""
 
+        if self.canonical_market is None:
+            with suppress(ValueError):
+                self.canonical_market = MarketType(self.market)
         if self.home_team.casefold() == self.away_team.casefold():
             raise ValueError("home_team and away_team must describe different teams.")
-        if self.market in _LINE_BASED_MARKETS and self.line is None:
-            raise ValueError(f"line is required when market is `{self.market.value}`.")
+        if self.canonical_market in _LINE_BASED_MARKETS and self.line is None:
+            raise ValueError(
+                f"line is required when market is `{self.canonical_market.value}`."
+            )
         return self
 
     def fixture_label(self) -> str:

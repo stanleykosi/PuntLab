@@ -1,11 +1,12 @@
 """Provider orchestration layer for PuntLab's ingestion workflows.
 
-Purpose: coordinate the concrete provider integrations behind one canonical
-fallback policy for fixtures, odds, stats, injuries, head-to-head history, and
-news ingestion.
+Purpose: coordinate the current-state provider integrations behind one
+canonical policy for SportyBet fixture/market/detail ingestion plus the
+remaining structured data sources used for injuries, head-to-head history,
+basketball stats, and news.
 Scope: provider construction, competition-to-provider routing metadata,
 cross-provider fixture matching, odds catalog generation, and explicit
-diagnostics when a planned fallback such as SportyBet is not yet implemented.
+diagnostics for partial coverage.
 Dependencies: the concrete provider classes under `src.providers`, the odds
 catalog helpers in `src.providers.odds_mapping`, runtime settings from
 `src.config`, and the shared ingestion schemas under `src.schemas`.
@@ -13,7 +14,9 @@ catalog helpers in `src.providers.odds_mapping`, runtime settings from
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
@@ -29,15 +32,26 @@ from src.config import (
 from src.providers.api_football import APIFootballProvider
 from src.providers.balldontlie import BallDontLieProvider
 from src.providers.base import ProviderError, RateLimitedClient
-from src.providers.football_data import FootballDataProvider
 from src.providers.odds_mapping import OddsMarketCatalog, build_odds_market_catalog
 from src.providers.rss_feeds import RSSFeedProvider
 from src.providers.tavily_search import TavilySearchProvider
-from src.providers.the_odds_api import TheOddsAPIProvider
+from src.schemas.fixture_details import FixtureDetails
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.news import NewsArticle
 from src.schemas.odds import NormalizedOdds
 from src.schemas.stats import InjuryData, PlayerStats, TeamStats
+from src.scrapers.sportybet_api import SportyBetAPIClient
+from src.scrapers.sportybet_browser import SportyBetBrowserScraper
+from src.scrapers.sportybet_fixture_probe import build_fixture_page_url
+from src.scrapers.sportybet_fixture_stats import (
+    SportyBetFixtureStatsResult,
+    SportyBetFixtureStatsScraper,
+    build_fixture_details_snapshot,
+)
+from src.scrapers.sportybet_today import (
+    SportyBetTodayGamesCollector,
+    build_fixtures_from_today_slate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +59,8 @@ _SOCCER_DEFAULT_SEASON_START_MONTH: Final[int] = 7
 _NBA_DEFAULT_SEASON_START_MONTH: Final[int] = 10
 _FIXTURE_MATCH_TIME_WINDOW: Final[timedelta] = timedelta(hours=18)
 _MATCH_NEWS_LOOKBACK_DAYS: Final[int] = 7
-_SOCCER_ODDS_MARKETS: Final[tuple[str, ...]] = (
-    # Sport-level Odds API endpoints reliably support these core pre-match
-    # market families across most soccer competitions on free plans.
-    # Additional niche markets (for example BTTS/double_chance/correct_score)
-    # are fetched opportunistically from fallback providers when available.
-    "h2h",
-    "totals",
-    "spreads",
-)
-_NBA_ODDS_MARKETS: Final[tuple[str, ...]] = ("h2h", "spreads", "totals")
+_DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRIES: Final[int] = 2
+_DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRY_BACKOFF_SECONDS: Final[float] = 1.0
 _TEAM_STOP_WORDS: Final[frozenset[str]] = frozenset(
     {
         "ac",
@@ -110,8 +116,6 @@ class CompetitionProviderRoute:
 
     competition_key: str
     api_football_league_id: int | None = None
-    football_data_code: str | None = None
-    the_odds_sport_key: str | None = None
     season_start_month: int = _SOCCER_DEFAULT_SEASON_START_MONTH
 
 
@@ -154,6 +158,23 @@ class StatsFetchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FixtureDetailsFetchResult:
+    """Structured SportyBet fixture-page details returned by the orchestrator.
+
+    Inputs:
+        SportyBet Today Games fixtures with Sportradar identifiers.
+
+    Outputs:
+        Compact per-fixture details for research plus diagnostics for missing
+        fixture-page coverage.
+    """
+
+    fixture_details: tuple[FixtureDetails, ...]
+    providers_attempted: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class InjuryFetchResult:
     """Structured injury-ingestion result with qualitative fallback support.
 
@@ -176,54 +197,38 @@ _ROUTES: Final[dict[str, CompetitionProviderRoute]] = {
     "england_premier_league": CompetitionProviderRoute(
         competition_key="england_premier_league",
         api_football_league_id=39,
-        football_data_code="PL",
-        the_odds_sport_key="soccer_epl",
     ),
     "spain_la_liga": CompetitionProviderRoute(
         competition_key="spain_la_liga",
         api_football_league_id=140,
-        football_data_code="PD",
-        the_odds_sport_key="soccer_spain_la_liga",
     ),
     "italy_serie_a": CompetitionProviderRoute(
         competition_key="italy_serie_a",
         api_football_league_id=135,
-        football_data_code="SA",
-        the_odds_sport_key="soccer_italy_serie_a",
     ),
     "germany_bundesliga": CompetitionProviderRoute(
         competition_key="germany_bundesliga",
         api_football_league_id=78,
-        football_data_code="BL1",
-        the_odds_sport_key="soccer_germany_bundesliga",
     ),
     "france_ligue_1": CompetitionProviderRoute(
         competition_key="france_ligue_1",
         api_football_league_id=61,
-        football_data_code="FL1",
-        the_odds_sport_key="soccer_france_ligue_one",
     ),
     "netherlands_eredivisie": CompetitionProviderRoute(
         competition_key="netherlands_eredivisie",
         api_football_league_id=88,
-        football_data_code="DED",
-        the_odds_sport_key="soccer_netherlands_eredivisie",
     ),
     "portugal_primeira_liga": CompetitionProviderRoute(
         competition_key="portugal_primeira_liga",
         api_football_league_id=94,
-        football_data_code="PPL",
-        the_odds_sport_key="soccer_portugal_primeira_liga",
     ),
     "belgium_pro_league": CompetitionProviderRoute(
         competition_key="belgium_pro_league",
         api_football_league_id=144,
-        the_odds_sport_key="soccer_belgium_first_div",
     ),
     "turkey_super_lig": CompetitionProviderRoute(
         competition_key="turkey_super_lig",
         api_football_league_id=203,
-        the_odds_sport_key="soccer_turkey_super_league",
     ),
     "scotland_premiership": CompetitionProviderRoute(
         competition_key="scotland_premiership",
@@ -256,7 +261,6 @@ _ROUTES: Final[dict[str, CompetitionProviderRoute]] = {
     "norway_eliteserien": CompetitionProviderRoute(
         competition_key="norway_eliteserien",
         api_football_league_id=103,
-        the_odds_sport_key="soccer_norway_eliteserien",
         season_start_month=1,
     ),
     "croatia_hnl": CompetitionProviderRoute(
@@ -274,23 +278,17 @@ _ROUTES: Final[dict[str, CompetitionProviderRoute]] = {
     "uefa_champions_league": CompetitionProviderRoute(
         competition_key="uefa_champions_league",
         api_football_league_id=2,
-        football_data_code="CL",
-        the_odds_sport_key="soccer_uefa_champs_league",
     ),
     "uefa_europa_league": CompetitionProviderRoute(
         competition_key="uefa_europa_league",
         api_football_league_id=3,
-        football_data_code="EL",
-        the_odds_sport_key="soccer_uefa_europa_league",
     ),
     "uefa_conference_league": CompetitionProviderRoute(
         competition_key="uefa_conference_league",
         api_football_league_id=848,
-        the_odds_sport_key="soccer_uefa_europa_conference_league",
     ),
     "nba": CompetitionProviderRoute(
         competition_key="nba",
-        the_odds_sport_key="basketball_nba",
         season_start_month=_NBA_DEFAULT_SEASON_START_MONTH,
     ),
 }
@@ -313,20 +311,29 @@ class ProviderOrchestrator:
         self,
         *,
         api_football: APIFootballProvider | None = None,
-        football_data: FootballDataProvider | None = None,
-        the_odds_api: TheOddsAPIProvider | None = None,
+        sportybet_today_collector: SportyBetTodayGamesCollector | None = None,
+        sportybet_api_client: SportyBetAPIClient | None = None,
+        sportybet_browser_scraper: SportyBetBrowserScraper | None = None,
+        sportybet_fixture_stats_scraper: SportyBetFixtureStatsScraper | None = None,
         balldontlie: BallDontLieProvider | None = None,
         rss_feeds: RSSFeedProvider | None = None,
         tavily_search: TavilySearchProvider | None = None,
         client: RateLimitedClient | None = None,
         cache: RedisClient | None = None,
+        sportybet_fixture_detail_retries: int = _DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRIES,
+        sportybet_fixture_detail_retry_backoff_seconds: float = (
+            _DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRY_BACKOFF_SECONDS
+        ),
+        sleep: Callable[[float], Awaitable[object]] | None = None,
     ) -> None:
         """Initialize provider instances and the route catalog.
 
         Args:
             api_football: Optional API-Football provider override.
-            football_data: Optional Football-Data.org provider override.
-            the_odds_api: Optional The Odds API provider override.
+            sportybet_today_collector: Optional SportyBet today-games fixture collector.
+            sportybet_api_client: Optional SportyBet API odds/markets override.
+            sportybet_browser_scraper: Optional SportyBet browser fallback override.
+            sportybet_fixture_stats_scraper: Optional SportyBet fixture-page detail scraper.
             balldontlie: Optional BALLDONTLIE provider override.
             rss_feeds: Optional RSS provider override.
             tavily_search: Optional Tavily provider override.
@@ -334,31 +341,73 @@ class ProviderOrchestrator:
                 must be constructed automatically.
             cache: Optional Redis cache wrapper used only when `client` is not
                 supplied and automatic provider construction is needed.
+            sportybet_fixture_detail_retries: Number of retry attempts for one
+                SportyBet fixture-detail fetch after the initial attempt.
+            sportybet_fixture_detail_retry_backoff_seconds: Delay between
+                SportyBet fixture-detail retries.
+            sleep: Optional async sleep function override used for tests.
         """
+
+        if sportybet_fixture_detail_retries < 0:
+            raise ValueError("sportybet_fixture_detail_retries must be zero or positive.")
+        if sportybet_fixture_detail_retry_backoff_seconds < 0:
+            raise ValueError(
+                "sportybet_fixture_detail_retry_backoff_seconds must be zero or positive."
+            )
 
         self._settings = get_settings()
         self._cache = cache
         self._client = client
+        self._owns_cache = False
         self._owns_client = False
+        self._sleep = sleep or asyncio.sleep
+        self._sportybet_fixture_detail_retries = sportybet_fixture_detail_retries
+        self._sportybet_fixture_detail_retry_backoff_seconds = (
+            sportybet_fixture_detail_retry_backoff_seconds
+        )
 
-        if self._client is None and any(
+        if self._cache is None and any(
             provider is None
             for provider in (
                 api_football,
-                football_data,
-                the_odds_api,
+                sportybet_api_client,
+                sportybet_browser_scraper,
                 balldontlie,
                 rss_feeds,
                 tavily_search,
             )
         ):
-            self._cache = self._cache or RedisClient()
+            self._cache = RedisClient()
+            self._owns_cache = True
+
+        if self._client is None and any(
+            provider is None
+            for provider in (
+                api_football,
+                balldontlie,
+                rss_feeds,
+                tavily_search,
+            )
+        ):
+            if self._cache is None:
+                self._cache = RedisClient()
+                self._owns_cache = True
             self._client = RateLimitedClient(self._cache)
             self._owns_client = True
 
         self._api_football = api_football or self._build_api_football()
-        self._football_data = football_data or self._build_football_data()
-        self._the_odds_api = the_odds_api or self._build_the_odds_api()
+        self._sportybet_today_collector = (
+            sportybet_today_collector or SportyBetTodayGamesCollector()
+        )
+        self._owns_sportybet_api_client = sportybet_api_client is None
+        self._sportybet_api_client = sportybet_api_client or SportyBetAPIClient(self._cache)
+        self._owns_sportybet_browser_scraper = sportybet_browser_scraper is None
+        self._sportybet_browser_scraper = sportybet_browser_scraper or SportyBetBrowserScraper(
+            self._cache
+        )
+        self._sportybet_fixture_stats_scraper = (
+            sportybet_fixture_stats_scraper or SportyBetFixtureStatsScraper()
+        )
         self._balldontlie = balldontlie or self._build_balldontlie()
         self._rss_feeds = rss_feeds or self._build_rss_feeds()
         self._tavily_search = tavily_search or self._build_tavily_search()
@@ -369,6 +418,7 @@ class ProviderOrchestrator:
         }
         self._competition_identity_index = self._build_competition_identity_index()
         self._api_fixture_cache: dict[tuple[str, date, int], tuple[NormalizedFixture, ...]] = {}
+        self._sportybet_fixture_stats_cache: dict[str, SportyBetFixtureStatsResult] = {}
 
     async def fetch_fixtures(
         self,
@@ -377,12 +427,13 @@ class ProviderOrchestrator:
         competitions: tuple[CompetitionConfig, ...] | None = None,
         season_overrides: dict[str, int] | None = None,
     ) -> tuple[NormalizedFixture, ...]:
-        """Fetch one day's fixtures using the configured provider chain.
+        """Fetch one day's fixtures from SportyBet's Today Games slate.
 
         Args:
             run_date: Date of the slate being analyzed.
             competitions: Optional competition subset. When omitted, the
-                orchestrator uses the canonical supported competition catalog.
+                orchestrator keeps the full Today Games slate for the
+                requested sports.
             season_overrides: Optional season-year overrides keyed by
                 `competition.key`.
 
@@ -390,49 +441,16 @@ class ProviderOrchestrator:
             A deduplicated tuple of normalized fixtures.
         """
 
-        selected_competitions = competitions or SUPPORTED_COMPETITIONS
-        collected_fixtures: list[NormalizedFixture] = []
-
-        for competition in selected_competitions:
-            route = self._route_for_competition(competition)
-            season = self._resolve_season(
-                competition=competition,
-                run_date=run_date,
-                season_overrides=season_overrides,
-                route=route,
+        del season_overrides
+        selected_competitions = competitions
+        requested_sports = self._today_sports_for_competitions(selected_competitions)
+        today_slate = await self._sportybet_today_collector.collect(sports=requested_sports)
+        collected_fixtures = list(build_fixtures_from_today_slate(today_slate))
+        if selected_competitions is not None:
+            collected_fixtures = self._filter_fixtures_to_competitions(
+                tuple(collected_fixtures),
+                selected_competitions,
             )
-
-            if competition.sport == SportName.BASKETBALL:
-                if self._balldontlie is None:
-                    logger.warning(
-                        "Skipping fixture fetch for %s because BALLDONTLIE is unavailable.",
-                        competition.key,
-                    )
-                    continue
-                try:
-                    basketball_run_fixtures = await self._balldontlie.fetch_games_by_date(
-                        run_date=run_date,
-                        seasons=(season,),
-                    )
-                except ProviderError as exc:
-                    logger.warning(
-                        "BALLDONTLIE fixture fetch failed for competition=%s date=%s: %s",
-                        competition.key,
-                        run_date,
-                        exc,
-                    )
-                    continue
-                collected_fixtures.extend(basketball_run_fixtures)
-                continue
-
-            soccer_run_fixtures = await self._fetch_soccer_fixtures_for_competition(
-                competition=competition,
-                route=route,
-                run_date=run_date,
-                season=season,
-            )
-            collected_fixtures.extend(soccer_run_fixtures)
-
         return self._deduplicate_fixtures(collected_fixtures)
 
     async def fetch_odds(
@@ -441,90 +459,21 @@ class ProviderOrchestrator:
         fixtures: tuple[NormalizedFixture, ...],
         markets_by_sport: dict[SportName, tuple[str, ...]] | None = None,
     ) -> OddsFetchResult:
-        """Fetch odds for a fixture slate and build a lossless market catalog.
+        """Fetch canonical SportyBet odds for a fixture slate.
 
         Args:
             fixtures: Canonical fixtures for the current run.
-            markets_by_sport: Optional provider market key overrides grouped by
-                sport for The Odds API.
+            markets_by_sport: Ignored. SportyBet exposes one canonical market
+                universe per fixture and no longer uses sport-level market-key
+                requests in this orchestrator.
 
         Returns:
-            A structured odds result containing the full market catalog and
-            unresolved fixture diagnostics.
+            A structured SportyBet odds result containing the full market
+            catalog and unresolved fixture diagnostics.
         """
 
-        if not fixtures:
-            empty_catalog = build_odds_market_catalog(())
-            return OddsFetchResult(
-                catalog=empty_catalog,
-                matched_rows=(),
-                unmatched_fixture_refs=(),
-                providers_attempted=(),
-            )
-
-        matched_rows: list[NormalizedOdds] = []
-        warnings: list[str] = []
-        providers_attempted: list[str] = []
-        fixture_map = {fixture.get_fixture_ref(): fixture for fixture in fixtures}
-        unmatched_fixtures = {fixture.get_fixture_ref(): fixture for fixture in fixtures}
-
-        if self._the_odds_api is not None:
-            providers_attempted.append(self._the_odds_api.provider_name)
-            try:
-                the_odds_rows = await self._fetch_the_odds_rows(
-                    fixtures=fixtures,
-                    markets_by_sport=markets_by_sport,
-                )
-            except ProviderError as exc:
-                warning = f"The Odds API odds fetch failed: {exc}"
-                logger.warning(warning)
-                warnings.append(warning)
-            else:
-                matched_from_primary, unmatched_primary = self._match_odds_rows_to_fixtures(
-                    odds_rows=the_odds_rows,
-                    fixtures=tuple(unmatched_fixtures.values()),
-                )
-                matched_rows.extend(matched_from_primary)
-                for fixture_ref in unmatched_primary:
-                    logger.info(
-                        "No The Odds API event match found for fixture_ref=%s; falling back.",
-                        fixture_ref,
-                    )
-                for matched_row in matched_from_primary:
-                    unmatched_fixtures.pop(matched_row.fixture_ref, None)
-
-        if unmatched_fixtures and self._api_football is not None:
-            providers_attempted.append(self._api_football.provider_name)
-            api_rows = await self._fetch_api_football_fallback_odds(
-                fixtures=tuple(unmatched_fixtures.values()),
-            )
-            if api_rows:
-                matched_rows.extend(api_rows)
-                for row in api_rows:
-                    unmatched_fixtures.pop(row.fixture_ref, None)
-
-        if unmatched_fixtures:
-            warning = (
-                "SportyBet odds fallback is not available yet. Remaining fixtures lack odds for: "
-                + ", ".join(sorted(unmatched_fixtures))
-            )
-            logger.warning(warning)
-            warnings.append(warning)
-
-        sport_by_fixture = {
-            fixture_ref: fixture.sport for fixture_ref, fixture in fixture_map.items()
-        }
-        catalog = build_odds_market_catalog(
-            tuple(matched_rows),
-            sport_by_fixture=sport_by_fixture,
-        )
-        return OddsFetchResult(
-            catalog=catalog,
-            matched_rows=tuple(catalog.all_rows()),
-            unmatched_fixture_refs=tuple(sorted(unmatched_fixtures)),
-            providers_attempted=tuple(providers_attempted),
-            warnings=tuple(warnings),
-        )
+        del markets_by_sport
+        return await self._fetch_sportybet_market_result(fixtures=fixtures)
 
     async def fetch_stats(
         self,
@@ -533,7 +482,7 @@ class ProviderOrchestrator:
         season_overrides: dict[str, int] | None = None,
         include_player_stats: bool = True,
     ) -> StatsFetchResult:
-        """Fetch team and player stats using sport-specific provider routing.
+        """Fetch team and player stats using the canonical current-state sources.
 
         Args:
             fixtures: Canonical fixtures for the current run.
@@ -559,65 +508,37 @@ class ProviderOrchestrator:
             fixture for fixture in fixtures if fixture.sport == SportName.BASKETBALL
         )
 
-        soccer_competitions = self._group_fixtures_by_competition_key(soccer_fixtures)
-        for competition_key, competition_fixtures in soccer_competitions.items():
-            competition = self._competition_by_key[competition_key]
-            route = self._route_for_competition(competition)
-            run_date = min(
-                fixture.kickoff.astimezone(UTC).date()
-                for fixture in competition_fixtures
-            )
-            season = self._resolve_season(
-                competition=competition,
-                run_date=run_date,
-                season_overrides=season_overrides,
-                route=route,
-            )
-
-            if (
-                route is not None
-                and self._api_football is not None
-                and route.api_football_league_id is not None
-            ):
-                providers_attempted.append(self._api_football.provider_name)
+        if soccer_fixtures:
+            providers_attempted.append("sportybet_fixture_stats")
+            for fixture in soccer_fixtures:
+                fixture_ref = fixture.get_fixture_ref()
                 try:
-                    team_stats.extend(
-                        await self._api_football.fetch_standings(
-                            league_id=route.api_football_league_id,
-                            season=season,
-                        )
+                    stats_result = await self._get_or_fetch_sportybet_fixture_stats_result(
+                        fixture
                     )
-                    if include_player_stats:
-                        player_stats.extend(
-                            await self._fetch_api_football_player_stats(
-                                fixtures=competition_fixtures,
-                                route=route,
-                                season=season,
-                            )
-                        )
+                except ValueError as exc:
+                    warning = f"SportyBet stats skipped for {fixture_ref}: {exc}"
+                    warnings.append(warning)
                     continue
-                except (ProviderError, ValueError) as exc:
-                    warning = f"API-Football stats fetch failed for {competition_key}: {exc}"
+                except Exception as exc:
+                    warning = f"SportyBet stats fetch failed for {fixture_ref}: {exc}"
                     logger.warning(warning)
                     warnings.append(warning)
+                    continue
 
-            if (
-                route is not None
-                and self._football_data is not None
-                and route.football_data_code is not None
-            ):
-                providers_attempted.append(self._football_data.provider_name)
-                try:
-                    team_stats.extend(
-                        await self._football_data.fetch_standings(
-                            competition_code=route.football_data_code,
-                            season=season,
-                        )
+                derived_team_stats = self._bind_sportybet_team_stats_to_fixture(
+                    fixture=fixture,
+                    stats_result=stats_result,
+                )
+                if not derived_team_stats:
+                    warning = (
+                        f"SportyBet stats fetch returned no scoreable team snapshots for "
+                        f"{fixture_ref}."
                     )
-                except ProviderError as exc:
-                    warning = f"Football-Data.org stats fetch failed for {competition_key}: {exc}"
                     logger.warning(warning)
                     warnings.append(warning)
+                    continue
+                team_stats.extend(derived_team_stats)
 
         if basketball_fixtures and self._balldontlie is not None:
             providers_attempted.append(self._balldontlie.provider_name)
@@ -650,11 +571,204 @@ class ProviderOrchestrator:
                 warnings.append(warning)
 
         return StatsFetchResult(
-            team_stats=tuple(team_stats),
+            team_stats=tuple(self._deduplicate_team_stats(team_stats)),
             player_stats=tuple(player_stats),
             providers_attempted=tuple(providers_attempted),
             warnings=tuple(warnings),
         )
+
+    async def fetch_fixture_details(
+        self,
+        *,
+        fixtures: tuple[NormalizedFixture, ...],
+    ) -> FixtureDetailsFetchResult:
+        """Fetch SportyBet fixture-page context for today's football slate.
+
+        Args:
+            fixtures: Canonical fixtures for the current run.
+
+        Returns:
+            Compact SportyBet fixture details plus explicit diagnostics for any
+            fixture that cannot be opened through the public fixture page.
+        """
+
+        football_fixtures = tuple(
+            fixture for fixture in fixtures if fixture.sport == SportName.SOCCER
+        )
+        if not football_fixtures:
+            return FixtureDetailsFetchResult(
+                fixture_details=(),
+                providers_attempted=(),
+                warnings=(),
+            )
+
+        providers_attempted = ("sportybet_fixture_stats",)
+        fixture_details: list[FixtureDetails] = []
+        warnings: list[str] = []
+
+        for fixture in football_fixtures:
+            fixture_ref = fixture.get_fixture_ref()
+            try:
+                stats_result = await self._get_or_fetch_sportybet_fixture_stats_result(
+                    fixture
+                )
+            except ValueError as exc:
+                warnings.append(f"SportyBet fixture details skipped for {fixture_ref}: {exc}")
+                continue
+            except Exception as exc:
+                warning = (
+                    f"SportyBet fixture details fetch failed for {fixture_ref}: {exc}"
+                )
+                logger.warning(warning)
+                warnings.append(warning)
+                continue
+
+            fixture_details.append(
+                build_fixture_details_snapshot(
+                    stats_result,
+                    fixture_ref=fixture_ref,
+                )
+            )
+
+        return FixtureDetailsFetchResult(
+            fixture_details=tuple(fixture_details),
+            providers_attempted=providers_attempted,
+            warnings=tuple(warnings),
+        )
+
+    async def _get_or_fetch_sportybet_fixture_stats_result(
+        self,
+        fixture: NormalizedFixture,
+    ) -> SportyBetFixtureStatsResult:
+        """Return one cached or freshly fetched SportyBet fixture-stats result."""
+
+        fixture_ref = fixture.get_fixture_ref()
+        cached_result = self._sportybet_fixture_stats_cache.get(fixture_ref)
+        if cached_result is not None:
+            return cached_result
+
+        fixture_url = self._build_sportybet_fixture_page_url(fixture)
+        attempt_count = self._sportybet_fixture_detail_retries + 1
+        last_error: Exception | None = None
+
+        for attempt_index in range(attempt_count):
+            try:
+                result = await self._sportybet_fixture_stats_scraper.fetch_fixture_stats(
+                    fixture_url=fixture_url,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= self._sportybet_fixture_detail_retries:
+                    break
+                if self._sportybet_fixture_detail_retry_backoff_seconds > 0:
+                    await self._sleep(
+                        self._sportybet_fixture_detail_retry_backoff_seconds
+                    )
+                continue
+
+            self._sportybet_fixture_stats_cache[fixture_ref] = result
+            return result
+
+        raise RuntimeError(
+            "Could not fetch SportyBet fixture details after "
+            f"{attempt_count} attempt(s): {last_error}"
+        ) from last_error
+
+    @staticmethod
+    def _build_sportybet_fixture_page_url(fixture: NormalizedFixture) -> str:
+        """Build the canonical SportyBet fixture page URL for one soccer fixture."""
+
+        if fixture.sportradar_id is None:
+            raise ValueError("missing Sportradar ID.")
+        if fixture.country is None:
+            raise ValueError("missing country.")
+        return build_fixture_page_url(
+            event_id=fixture.sportradar_id,
+            home_team=fixture.home_team,
+            away_team=fixture.away_team,
+            country=fixture.country,
+            competition=fixture.competition,
+            sport="football",
+        )
+
+    def _bind_sportybet_team_stats_to_fixture(
+        self,
+        *,
+        fixture: NormalizedFixture,
+        stats_result: SportyBetFixtureStatsResult,
+    ) -> tuple[TeamStats, ...]:
+        """Normalize derived SportyBet team stats to the canonical fixture labels."""
+
+        bound_team_stats: list[TeamStats] = []
+        for team_stats in stats_result.team_stats:
+            update: dict[str, object] = {"competition": fixture.competition}
+
+            if (
+                stats_result.home_team_uid is not None
+                and team_stats.team_id == stats_result.home_team_uid
+            ):
+                update["team_name"] = fixture.home_team
+                if fixture.home_team_id is not None:
+                    update["team_id"] = fixture.home_team_id
+            elif (
+                stats_result.away_team_uid is not None
+                and team_stats.team_id == stats_result.away_team_uid
+            ):
+                update["team_name"] = fixture.away_team
+                if fixture.away_team_id is not None:
+                    update["team_id"] = fixture.away_team_id
+            elif self._team_similarity(team_stats.team_name, fixture.home_team) >= 0.93:
+                update["team_name"] = fixture.home_team
+                if fixture.home_team_id is not None:
+                    update["team_id"] = fixture.home_team_id
+            elif self._team_similarity(team_stats.team_name, fixture.away_team) >= 0.93:
+                update["team_name"] = fixture.away_team
+                if fixture.away_team_id is not None:
+                    update["team_id"] = fixture.away_team_id
+            else:
+                continue
+
+            bound_team_stats.append(team_stats.model_copy(update=update))
+
+        return tuple(bound_team_stats)
+
+    @staticmethod
+    def _deduplicate_team_stats(team_stats: list[TeamStats]) -> list[TeamStats]:
+        """Keep the richest team-stat snapshot per sport/team/competition key."""
+
+        deduplicated: dict[tuple[SportName, str, str], TeamStats] = {}
+        for stats in team_stats:
+            team_key = (
+                stats.sport,
+                (stats.team_id or stats.team_name).casefold(),
+                (stats.competition or "").casefold(),
+            )
+            current = deduplicated.get(team_key)
+            if current is None:
+                deduplicated[team_key] = stats
+                continue
+            if ProviderOrchestrator._team_stats_quality(
+                stats
+            ) >= ProviderOrchestrator._team_stats_quality(current):
+                deduplicated[team_key] = stats
+        return list(deduplicated.values())
+
+    @staticmethod
+    def _team_stats_quality(team_stats: TeamStats) -> float:
+        """Estimate how useful one team-stat snapshot is for deterministic scoring."""
+
+        quality = float(team_stats.matches_played)
+        if team_stats.form:
+            quality += min(len(team_stats.form), 10) * 0.5
+        if team_stats.avg_goals_scored is not None:
+            quality += 1.0
+        if team_stats.avg_goals_conceded is not None:
+            quality += 1.0
+        if team_stats.position is not None:
+            quality += 0.5
+        if team_stats.advanced_metrics:
+            quality += min(len(team_stats.advanced_metrics), 4) * 0.5
+        return quality
 
     async def fetch_injuries(
         self,
@@ -683,7 +797,15 @@ class ProviderOrchestrator:
         soccer_fixtures = tuple(
             fixture for fixture in fixtures if fixture.sport == SportName.SOCCER
         )
-        soccer_competitions = self._group_fixtures_by_competition_key(soccer_fixtures)
+        soccer_competitions, unsupported_soccer_fixtures = (
+            self._partition_fixtures_by_competition_key(soccer_fixtures)
+        )
+        unsupported_injury_warning = self._unsupported_competition_warning(
+            capability="injury",
+            fixtures=unsupported_soccer_fixtures,
+        )
+        if unsupported_injury_warning is not None:
+            warnings.append(unsupported_injury_warning)
         if soccer_competitions and self._api_football is not None:
             providers_attempted.append(self._api_football.provider_name)
             for competition_key, competition_fixtures in soccer_competitions.items():
@@ -868,29 +990,25 @@ class ProviderOrchestrator:
         return tuple(h2h_fixtures)
 
     async def fetch_markets(self, *, fixtures: tuple[NormalizedFixture, ...]) -> OddsFetchResult:
-        """Fail fast until the SportyBet market resolvers exist.
+        """Fetch canonical SportyBet markets for the supplied fixture slate.
 
         Args:
             fixtures: Canonical fixtures whose SportyBet markets are requested.
-
-        Raises:
-            ProviderError: Always, until the dedicated SportyBet scraper steps
-                are implemented.
         """
 
-        raise ProviderError(
-            "sportybet",
-            (
-                "SportyBet market orchestration is not available yet. "
-                "Implement Steps 22-24 before calling fetch_markets()."
-            ),
-        )
+        return await self._fetch_sportybet_market_result(fixtures=fixtures)
 
     async def aclose(self) -> None:
-        """Close the shared HTTP client when the orchestrator created it."""
+        """Close the owned provider helpers constructed by the orchestrator."""
 
+        if self._owns_sportybet_browser_scraper:
+            await self._sportybet_browser_scraper.aclose()
+        if self._owns_sportybet_api_client:
+            await self._sportybet_api_client.aclose()
         if self._client is not None and self._owns_client:
             await self._client.aclose()
+        if self._cache is not None and self._owns_cache:
+            await self._cache.close()
 
     def _build_api_football(self) -> APIFootballProvider | None:
         """Construct API-Football when the environment is configured for it."""
@@ -898,20 +1016,6 @@ class ProviderOrchestrator:
         if self._client is None or self._settings.data_providers.api_football_key is None:
             return None
         return APIFootballProvider(self._client)
-
-    def _build_football_data(self) -> FootballDataProvider | None:
-        """Construct Football-Data.org when the environment is configured for it."""
-
-        if self._client is None or self._settings.data_providers.football_data_api_key is None:
-            return None
-        return FootballDataProvider(self._client)
-
-    def _build_the_odds_api(self) -> TheOddsAPIProvider | None:
-        """Construct The Odds API provider when a key is available."""
-
-        if self._client is None or self._settings.data_providers.the_odds_api_key is None:
-            return None
-        return TheOddsAPIProvider(self._client)
 
     def _build_balldontlie(self) -> BallDontLieProvider | None:
         """Construct BALLDONTLIE when a key is available."""
@@ -934,65 +1038,6 @@ class ProviderOrchestrator:
             return None
         return TavilySearchProvider(self._client)
 
-    async def _fetch_soccer_fixtures_for_competition(
-        self,
-        *,
-        competition: CompetitionConfig,
-        route: CompetitionProviderRoute | None,
-        run_date: date,
-        season: int,
-    ) -> tuple[NormalizedFixture, ...]:
-        """Fetch one soccer competition's fixtures with provider fallback."""
-
-        if route is None:
-            logger.warning(
-                "Skipping fixture fetch for competition=%s because no route is configured.",
-                competition.key,
-            )
-            return ()
-
-        if self._api_football is not None and route.api_football_league_id is not None:
-            try:
-                api_fixtures = await self._api_football.fetch_fixtures_by_date(
-                    run_date=run_date,
-                    league_id=route.api_football_league_id,
-                    season=season,
-                )
-            except ProviderError as exc:
-                logger.warning(
-                    "API-Football fixture fetch failed for competition=%s date=%s: %s",
-                    competition.key,
-                    run_date,
-                    exc,
-                )
-            else:
-                canonical_fixtures = tuple(
-                    self._apply_competition_identity(fixture, competition)
-                    for fixture in api_fixtures
-                )
-                self._api_fixture_cache[(competition.key, run_date, season)] = canonical_fixtures
-                return canonical_fixtures
-
-        if self._football_data is not None and route.football_data_code is not None:
-            try:
-                football_data_fixtures = await self._football_data.fetch_fixtures_by_date(
-                        run_date=run_date,
-                        competition_code=route.football_data_code,
-                        season=season,
-                    )
-                return tuple(
-                    self._apply_competition_identity(fixture, competition)
-                    for fixture in football_data_fixtures
-                )
-            except ProviderError as exc:
-                logger.warning(
-                    "Football-Data.org fixture fetch failed for competition=%s date=%s: %s",
-                    competition.key,
-                    run_date,
-                    exc,
-                )
-        return ()
-
     @staticmethod
     def _apply_competition_identity(
         fixture: NormalizedFixture,
@@ -1013,136 +1058,110 @@ class ProviderOrchestrator:
             }
         )
 
-    async def _fetch_the_odds_rows(
+    async def _fetch_sportybet_market_result(
         self,
         *,
         fixtures: tuple[NormalizedFixture, ...],
-        markets_by_sport: dict[SportName, tuple[str, ...]] | None,
-    ) -> tuple[NormalizedOdds, ...]:
-        """Fetch The Odds API rows grouped by sport-key route."""
+    ) -> OddsFetchResult:
+        """Fetch SportyBet markets for every fixture and build one catalog."""
 
-        if self._the_odds_api is None:
-            return ()
+        if not fixtures:
+            empty_catalog = build_odds_market_catalog(())
+            return OddsFetchResult(
+                catalog=empty_catalog,
+                matched_rows=(),
+                unmatched_fixture_refs=(),
+                providers_attempted=(),
+            )
 
-        grouped_fixtures: dict[str, list[NormalizedFixture]] = {}
+        matched_rows: list[NormalizedOdds] = []
+        warnings: list[str] = []
+        providers_attempted: list[str] = []
+        unmatched_fixture_refs: list[str] = []
+        fixture_map = {fixture.get_fixture_ref(): fixture for fixture in fixtures}
+
         for fixture in fixtures:
-            route = self._route_for_fixture(fixture)
-            if route is None or route.the_odds_sport_key is None:
-                continue
-            grouped_fixtures.setdefault(route.the_odds_sport_key, []).append(fixture)
-
-        odds_rows: list[NormalizedOdds] = []
-        for sport_key, sport_fixtures in grouped_fixtures.items():
-            earliest_kickoff = min(
-                fixture.kickoff.astimezone(UTC) for fixture in sport_fixtures
-            ) - timedelta(hours=6)
-            latest_kickoff = max(
-                fixture.kickoff.astimezone(UTC) for fixture in sport_fixtures
-            ) + timedelta(hours=6)
-            sport = sport_fixtures[0].sport
-            configured_market_keys = (
-                markets_by_sport.get(sport)
-                if markets_by_sport is not None and sport in markets_by_sport
-                else None
-            )
-            market_keys = configured_market_keys or (
-                _SOCCER_ODDS_MARKETS if sport == SportName.SOCCER else _NBA_ODDS_MARKETS
-            )
-            odds_rows.extend(
-                await self._the_odds_api.fetch_odds(
-                    sport_key=sport_key,
-                    markets=market_keys,
-                    commence_time_from=earliest_kickoff,
-                    commence_time_to=latest_kickoff,
-                )
-            )
-
-        return tuple(odds_rows)
-
-    async def _fetch_api_football_fallback_odds(
-        self,
-        *,
-        fixtures: tuple[NormalizedFixture, ...],
-    ) -> tuple[NormalizedOdds, ...]:
-        """Fetch API-Football odds for fixtures unresolved by the primary odds feed."""
-
-        if self._api_football is None:
-            return ()
-
-        rows: list[NormalizedOdds] = []
-        for fixture in fixtures:
-            api_fixture = await self._resolve_api_football_fixture_for_fixture(fixture)
-            if api_fixture is None:
-                logger.warning(
-                    "Skipping API-Football odds fallback because fixture=%s could not be "
-                    "matched to an API-Football fixture.",
-                    fixture.get_fixture_ref(),
-                )
-                continue
-
             try:
-                fetched_rows = await self._api_football.fetch_odds_by_fixture(
-                    fixture_id=int(api_fixture.source_id)
+                fixture_rows = await self._fetch_sportybet_rows_for_fixture(
+                    fixture=fixture,
+                    providers_attempted=providers_attempted,
                 )
-            except (ProviderError, ValueError) as exc:
-                logger.warning(
-                    "API-Football odds fallback failed for fixture=%s api_fixture=%s: %s",
-                    fixture.get_fixture_ref(),
-                    api_fixture.source_id,
-                    exc,
+            except ProviderError as exc:
+                warning = (
+                    "SportyBet odds fetch failed for "
+                    f"{fixture.get_fixture_ref()}: {exc}"
                 )
+                logger.warning(warning)
+                warnings.append(warning)
+                unmatched_fixture_refs.append(fixture.get_fixture_ref())
                 continue
 
-            rows.extend(
-                row.model_copy(update={"fixture_ref": fixture.get_fixture_ref()})
-                for row in fetched_rows
-            )
-        return tuple(rows)
+            matched_rows.extend(fixture_rows)
 
-    async def _fetch_api_football_player_stats(
+        sport_by_fixture = {
+            fixture_ref: fixture.sport for fixture_ref, fixture in fixture_map.items()
+        }
+        catalog = build_odds_market_catalog(
+            tuple(matched_rows),
+            sport_by_fixture=sport_by_fixture,
+        )
+        return OddsFetchResult(
+            catalog=catalog,
+            matched_rows=tuple(catalog.all_rows()),
+            unmatched_fixture_refs=tuple(sorted(unmatched_fixture_refs)),
+            providers_attempted=tuple(providers_attempted),
+            warnings=tuple(warnings),
+        )
+
+    async def _fetch_sportybet_rows_for_fixture(
         self,
         *,
-        fixtures: tuple[NormalizedFixture, ...],
-        route: CompetitionProviderRoute,
-        season: int,
-    ) -> tuple[PlayerStats, ...]:
-        """Fetch player stats for the unique API-Football team IDs in a slate."""
+        fixture: NormalizedFixture,
+        providers_attempted: list[str],
+    ) -> tuple[NormalizedOdds, ...]:
+        """Fetch one fixture's SportyBet rows using API-first browser fallback."""
 
-        if self._api_football is None or route.api_football_league_id is None:
-            return ()
+        if fixture.sportradar_id is None:
+            raise ProviderError(
+                "sportybet",
+                (
+                    "fixture.sportradar_id is required for canonical SportyBet odds "
+                    f"fetching ({fixture.get_fixture_ref()})."
+                ),
+            )
 
-        player_rows: list[PlayerStats] = []
-        seen_team_ids: set[int] = set()
-        for fixture in fixtures:
-            api_fixture = await self._resolve_api_football_fixture_for_fixture(fixture)
-            if api_fixture is None:
-                continue
-            for team_id in (api_fixture.home_team_id, api_fixture.away_team_id):
-                if team_id is None:
-                    continue
-                try:
-                    numeric_team_id = int(team_id)
-                except ValueError:
-                    continue
-                if numeric_team_id in seen_team_ids:
-                    continue
-                seen_team_ids.add(numeric_team_id)
-                try:
-                    player_rows.extend(
-                        await self._api_football.fetch_player_stats(
-                            season=season,
-                            team_id=numeric_team_id,
-                            league_id=route.api_football_league_id,
-                        )
-                    )
-                except (ProviderError, ValueError) as exc:
-                    logger.warning(
-                        "API-Football player stats fetch failed for team_id=%s competition=%s: %s",
-                        numeric_team_id,
-                        route.competition_key,
-                        exc,
-                    )
-        return tuple(player_rows)
+        self._append_provider_attempt(providers_attempted, "sportybet_api")
+        api_error: ProviderError | None = None
+        try:
+            return await self._sportybet_api_client.fetch_markets(
+                fixture.sportradar_id,
+                fixture=fixture,
+            )
+        except ProviderError as exc:
+            api_error = exc
+
+        self._append_provider_attempt(providers_attempted, "sportybet_browser")
+        sportybet_url = self._sportybet_api_client.build_sportybet_url(fixture)
+        try:
+            return await self._sportybet_browser_scraper.scrape_markets(
+                sportybet_url,
+                fixture=fixture,
+            )
+        except ProviderError as browser_error:
+            raise ProviderError(
+                "sportybet",
+                (
+                    f"SportyBet API failed: {api_error}. "
+                    f"SportyBet browser fallback failed: {browser_error}"
+                ),
+            ) from browser_error
+
+    @staticmethod
+    def _append_provider_attempt(providers_attempted: list[str], provider_name: str) -> None:
+        """Record one provider attempt once while preserving first-seen order."""
+
+        if provider_name not in providers_attempted:
+            providers_attempted.append(provider_name)
 
     async def _remap_api_football_injuries(
         self,
@@ -1242,95 +1261,6 @@ class ProviderOrchestrator:
         )
         self._api_fixture_cache[cache_key] = fixtures
         return fixtures
-
-    def _match_odds_rows_to_fixtures(
-        self,
-        *,
-        odds_rows: tuple[NormalizedOdds, ...],
-        fixtures: tuple[NormalizedFixture, ...],
-    ) -> tuple[tuple[NormalizedOdds, ...], tuple[str, ...]]:
-        """Match provider odds rows to canonical fixtures by event identity."""
-
-        event_groups: dict[str, list[NormalizedOdds]] = {}
-        for row in odds_rows:
-            raw_event_id = row.raw_metadata.get("event_id")
-            group_key = str(raw_event_id) if raw_event_id is not None else row.fixture_ref
-            event_groups.setdefault(group_key, []).append(row)
-
-        matched_rows: list[NormalizedOdds] = []
-        matched_fixture_refs: set[str] = set()
-        for group_rows in event_groups.values():
-            sample_row = group_rows[0]
-            home_team = self._string_metadata(sample_row, "home_team")
-            away_team = self._string_metadata(sample_row, "away_team")
-            commence_time = self._datetime_metadata(sample_row, "commence_time")
-            sport_key = self._string_metadata(sample_row, "sport_key")
-            candidate_fixtures = self._filter_fixtures_by_sport_key(
-                fixtures=fixtures,
-                sport_key=sport_key,
-            )
-            matched_fixture = self._find_best_fixture_match(
-                reference_home_team=home_team,
-                reference_away_team=away_team,
-                reference_kickoff=commence_time,
-                candidates=candidate_fixtures,
-                sport=self._infer_fixture_sport(group_rows, fixtures),
-                competition=None,
-                country=None,
-            )
-            if matched_fixture is None:
-                continue
-
-            matched_fixture_ref = matched_fixture.get_fixture_ref()
-            matched_fixture_refs.add(matched_fixture_ref)
-            matched_rows.extend(
-                row.model_copy(update={"fixture_ref": matched_fixture_ref}) for row in group_rows
-            )
-
-        unmatched_fixture_refs = tuple(
-            sorted(
-                fixture.get_fixture_ref()
-                for fixture in fixtures
-                if fixture.get_fixture_ref() not in matched_fixture_refs
-            )
-        )
-        return tuple(matched_rows), unmatched_fixture_refs
-
-    def _filter_fixtures_by_sport_key(
-        self,
-        *,
-        fixtures: tuple[NormalizedFixture, ...],
-        sport_key: str | None,
-    ) -> tuple[NormalizedFixture, ...]:
-        """Restrict fixture candidates to the same The Odds sport-key route.
-
-        Inputs:
-            fixtures: Current fixture candidates still unresolved by prior odds
-                rows.
-            sport_key: The Odds API sport key attached to one event group.
-
-        Outputs:
-            Fixtures that share the same configured `the_odds_sport_key`. Falls
-            back to the original candidate list when no scoped fixtures exist.
-        """
-
-        if sport_key is None:
-            return fixtures
-
-        normalized_sport_key = sport_key.strip().lower()
-        if not normalized_sport_key:
-            return fixtures
-
-        scoped_fixtures = tuple(
-            fixture
-            for fixture in fixtures
-            if (
-                (route := self._route_for_fixture(fixture)) is not None
-                and route.the_odds_sport_key is not None
-                and route.the_odds_sport_key.lower() == normalized_sport_key
-            )
-        )
-        return scoped_fixtures if scoped_fixtures else fixtures
 
     def _match_provider_fixtures_to_canonical(
         self,
@@ -1519,23 +1449,95 @@ class ProviderOrchestrator:
         )
         return run_date.year if run_date.month >= season_start_month else run_date.year - 1
 
-    def _group_fixtures_by_competition_key(
+    def _partition_fixtures_by_competition_key(
         self,
         fixtures: tuple[NormalizedFixture, ...],
-    ) -> dict[str, tuple[NormalizedFixture, ...]]:
-        """Group fixtures by resolved competition key while preserving order."""
+    ) -> tuple[dict[str, tuple[NormalizedFixture, ...]], tuple[NormalizedFixture, ...]]:
+        """Group supported fixtures by competition key and return unsupported rows."""
 
         grouped: dict[str, list[NormalizedFixture]] = {}
+        unsupported: list[NormalizedFixture] = []
         for fixture in fixtures:
             competition = self._competition_for_fixture(fixture)
             if competition is None:
-                logger.warning(
-                    "Skipping fixture=%s because no competition mapping is configured.",
-                    fixture.get_fixture_ref(),
-                )
+                unsupported.append(fixture)
                 continue
             grouped.setdefault(competition.key, []).append(fixture)
-        return {key: tuple(values) for key, values in grouped.items()}
+        return {key: tuple(values) for key, values in grouped.items()}, tuple(unsupported)
+
+    @staticmethod
+    def _today_sports_for_competitions(
+        competitions: tuple[CompetitionConfig, ...] | None,
+    ) -> tuple[str, ...]:
+        """Resolve the SportyBet today-games sport selectors for fixture collection."""
+
+        if competitions is None:
+            return ("football",)
+
+        ordered_sports: list[str] = []
+        seen: set[str] = set()
+        for competition in competitions:
+            sport_selector = "football" if competition.sport == SportName.SOCCER else "basketball"
+            if sport_selector in seen:
+                continue
+            seen.add(sport_selector)
+            ordered_sports.append(sport_selector)
+        return tuple(ordered_sports) or ("football",)
+
+    def _filter_fixtures_to_competitions(
+        self,
+        fixtures: tuple[NormalizedFixture, ...],
+        competitions: tuple[CompetitionConfig, ...],
+    ) -> list[NormalizedFixture]:
+        """Keep only fixtures whose competition identity matches the requested subset."""
+
+        allowed_keys = {competition.key for competition in competitions}
+        filtered_fixtures: list[NormalizedFixture] = []
+        for fixture in fixtures:
+            competition = self._competition_for_fixture(fixture)
+            if competition is None:
+                continue
+            if competition.key not in allowed_keys:
+                continue
+            filtered_fixtures.append(fixture)
+        return filtered_fixtures
+
+    def _unsupported_competition_warning(
+        self,
+        *,
+        capability: str,
+        fixtures: tuple[NormalizedFixture, ...],
+    ) -> str | None:
+        """Describe unsupported today-slate competitions for operator diagnostics."""
+
+        if not fixtures:
+            return None
+
+        competition_labels: list[str] = []
+        seen_labels: set[tuple[str, str | None]] = set()
+        for fixture in fixtures:
+            normalized_label = (
+                self._normalize_phrase(fixture.competition),
+                self._normalize_optional_phrase(fixture.country),
+            )
+            if normalized_label in seen_labels:
+                continue
+            seen_labels.add(normalized_label)
+            if fixture.country is not None:
+                competition_labels.append(f"{fixture.competition} ({fixture.country})")
+            else:
+                competition_labels.append(fixture.competition)
+
+        preview_labels = competition_labels[:6]
+        if len(competition_labels) > len(preview_labels):
+            preview_labels.append(f"+{len(competition_labels) - len(preview_labels)} more")
+
+        fixture_noun = "fixture" if len(fixtures) == 1 else "fixtures"
+        return (
+            f"Structured {capability} coverage is unavailable for {len(fixtures)} "
+            f"today-slate {fixture_noun} from competitions without provider routing: "
+            f"{', '.join(preview_labels)}."
+        )
 
     def _deduplicate_fixtures(
         self,
@@ -1595,50 +1597,6 @@ class ProviderOrchestrator:
                 seen.add(numeric_team_id)
                 team_ids.append(numeric_team_id)
         return tuple(team_ids)
-
-    def _infer_fixture_sport(
-        self,
-        group_rows: list[NormalizedOdds],
-        fixtures: tuple[NormalizedFixture, ...],
-    ) -> SportName | None:
-        """Infer the sport for one odds event group from metadata or fixtures."""
-
-        sample_row = group_rows[0]
-        raw_sport_key = self._string_metadata(sample_row, "sport_key")
-        if raw_sport_key is not None:
-            normalized_sport_key = raw_sport_key.lower()
-            if normalized_sport_key.startswith("soccer_"):
-                return SportName.SOCCER
-            if normalized_sport_key.startswith("basketball_"):
-                return SportName.BASKETBALL
-
-        for fixture in fixtures:
-            if fixture.get_fixture_ref() == sample_row.fixture_ref:
-                return fixture.sport
-        return None
-
-    @staticmethod
-    def _string_metadata(row: NormalizedOdds, key: str) -> str | None:
-        """Extract one string metadata field from a normalized odds row."""
-
-        value = row.raw_metadata.get(key)
-        if not isinstance(value, str):
-            return None
-        normalized = value.strip()
-        return normalized or None
-
-    @staticmethod
-    def _datetime_metadata(row: NormalizedOdds, key: str) -> datetime | None:
-        """Extract one timezone-aware datetime from odds metadata when present."""
-
-        value = row.raw_metadata.get(key)
-        if not isinstance(value, str):
-            return None
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     @staticmethod
     def _kickoff_penalty(
@@ -1713,6 +1671,7 @@ class ProviderOrchestrator:
 
 __all__ = [
     "CompetitionProviderRoute",
+    "FixtureDetailsFetchResult",
     "InjuryFetchResult",
     "OddsFetchResult",
     "ProviderOrchestrator",

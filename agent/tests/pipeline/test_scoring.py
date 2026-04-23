@@ -246,15 +246,17 @@ async def test_scoring_node_generates_match_scores_and_advances_stage() -> None:
     assert len(result["match_scores"]) == 1
     score = result["match_scores"][0]
     assert score.fixture_ref == fixture.get_fixture_ref()
-    assert score.recommended_market == MarketType.MATCH_RESULT
-    assert score.recommended_selection == "home"
+    assert score.recommended_market == "full_time_result"
+    assert score.recommended_market_label == "Full Time Result"
+    assert score.recommended_canonical_market is MarketType.MATCH_RESULT
+    assert score.recommended_selection == "Arsenal"
     assert score.recommended_odds == pytest.approx(1.64)
     assert score.confidence > 0.60
 
 
 @pytest.mark.asyncio
-async def test_scoring_node_records_fixture_failures_and_continues() -> None:
-    """Fixtures that cannot be matched to stats should not block the full slate."""
+async def test_scoring_node_scores_unsupported_fixtures_without_forced_recommendations() -> None:
+    """Fixtures without exact stats should still score, but without forced picks."""
 
     scored_fixture = build_fixture(
         sportradar_id="sr:match:7001",
@@ -339,19 +341,20 @@ async def test_scoring_node_records_fixture_failures_and_continues() -> None:
     )
 
     assert result["current_stage"] == PipelineStage.RANKING
-    assert len(result["match_scores"]) == 1
-    assert result["match_scores"][0].fixture_ref == scored_fixture.get_fixture_ref()
-    assert result["errors"] == [
-        (
-            "Scoring failed for sr:match:7002: calculate_match_score could not match any "
-            "TeamStats records to the fixture."
-        )
+    assert len(result["match_scores"]) == 2
+    assert [score.fixture_ref for score in result["match_scores"]] == [
+        scored_fixture.get_fixture_ref(),
+        failed_fixture.get_fixture_ref(),
     ]
+    assert result["match_scores"][0].recommended_selection == "Arsenal"
+    assert result["match_scores"][1].recommended_market is None
+    assert result["match_scores"][1].recommended_selection is None
+    assert result["errors"] == []
 
 
 @pytest.mark.asyncio
-async def test_scoring_node_groups_repeated_failures_by_reason() -> None:
-    """Repeated scoring failures with the same cause should be summarized once."""
+async def test_scoring_node_keeps_repeated_missing_stats_fixtures_non_actionable() -> None:
+    """Repeated missing-stats fixtures should still score conservatively."""
 
     failed_fixture_one = build_fixture(
         sportradar_id="sr:match:7101",
@@ -395,14 +398,14 @@ async def test_scoring_node_groups_repeated_failures_by_reason() -> None:
         engine=ScoringEngine(),
     )
 
-    assert result["match_scores"] == []
-    assert result["errors"] == [
-        (
-            "Scoring failed for 2 fixtures due to: calculate_match_score could not "
-            "match any TeamStats records to the fixture. "
-            "Sample fixtures: sr:match:7101, sr:match:7102."
-        )
+    assert len(result["match_scores"]) == 2
+    assert [score.fixture_ref for score in result["match_scores"]] == [
+        failed_fixture_one.get_fixture_ref(),
+        failed_fixture_two.get_fixture_ref(),
     ]
+    assert all(score.recommended_market is None for score in result["match_scores"])
+    assert all(score.recommended_selection is None for score in result["match_scores"])
+    assert result["errors"] == []
 
 
 @pytest.mark.asyncio

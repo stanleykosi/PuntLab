@@ -1,10 +1,11 @@
 """Market-resolution node for PuntLab's LangGraph pipeline.
 
 Purpose: resolve ranked match recommendations into sportsbook-ready markets
-using the canonical resolver fallback chain before accumulator building.
-Scope: fixture lookup, deterministic resolver orchestration, full odds-catalog
-fallback support, and recoverable diagnostics for per-fixture resolution
-failures that should not block the rest of the slate.
+using the canonical SportyBet resolver fallback chain before accumulator
+building.
+Scope: fixture lookup, deterministic resolver orchestration, prefetched
+SportyBet catalog support, and recoverable diagnostics for per-fixture
+resolution failures that should not block the rest of the slate.
 Dependencies: `src.scrapers.resolver.MarketResolver` for source fallback,
 `src.pipeline.state.PipelineState` for validated state IO, and the shared
 fixture, ranking, and resolved-market schemas.
@@ -30,7 +31,7 @@ _RESOLUTION_SKIPPED_PATTERN = re.compile(
     r"^Market resolution skipped for (?P<fixture>.+?): (?P<reason>.+)$"
 )
 _FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|football-data:\d+|api-football:\d+|balldontlie:\d+|the-odds-api:[a-z0-9_-]+)\b",
+    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
     flags=re.IGNORECASE,
 )
 
@@ -57,7 +58,7 @@ async def market_resolution_node(
         state if isinstance(state, PipelineState) else PipelineState.model_validate(state)
     )
     fixture_index = _index_fixtures(validated_state.fixtures)
-    external_odds = validated_state.odds_market_catalog.all_rows()
+    prefetched_rows = validated_state.odds_market_catalog.all_rows()
     diagnostics: list[str] = []
     resolved_markets: list[ResolvedMarket] = []
 
@@ -77,8 +78,8 @@ async def market_resolution_node(
             ):
                 diagnostics.append(
                     "Market resolution skipped for "
-                    f"{ranked_match.fixture_ref}: ranked match lacks a canonical "
-                    "recommended market and selection."
+                    f"{ranked_match.fixture_ref}: ranked match lacks a recommended market "
+                    "and selection."
                 )
                 continue
 
@@ -87,7 +88,7 @@ async def market_resolution_node(
                     await stage_resolver.resolve(
                         fixture,
                         ranked_match,
-                        external_odds=external_odds,
+                        prefetched_rows=prefetched_rows,
                     )
                 )
             except (ProviderError, ValueError) as exc:
@@ -192,11 +193,13 @@ def _normalize_market_resolver_detail(detail: str) -> str:
 
     normalized = " ".join(detail.split())
     if (
-        "External odds fallback did not contain a compatible canonical market for the fixture."
+        "No SportyBet source produced a compatible canonical market for the fixture."
+        in normalized
+        or "No SportyBet source produced a compatible market for the fixture."
         in normalized
     ):
         return (
-            "[market-resolver] no compatible canonical odds were found for the "
+            "[market-resolver] no compatible SportyBet odds were found for the "
             "recommended market and selection."
         )
     normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)

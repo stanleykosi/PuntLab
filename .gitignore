@@ -15,6 +15,7 @@
 .DS_Store
 .idea/
 .vscode/
+.codex
 
 # Python
 __pycache__/
@@ -48,3 +49,9 @@ redis-data/
 
 # Supabase local tooling
 .supabase/
+
+# Local SportyBet investigation artifacts
+/preMatch-index*.js
+/football-today-*.jsonl
+/sportybet-fixture-probe-*/
+/sportybet-fixture-stats-*/

@@ -45,8 +45,10 @@ def test_resolve_prompt_task_rejects_unknown_values() -> None:
             {
                 "competition_context",
                 "fixture_summary",
+                "fixture_details",
                 "kickoff_context",
                 "known_absences",
+                "market_menu",
                 "recent_news_bullets",
                 "run_date",
                 "source_labels",
@@ -91,6 +93,8 @@ def test_research_prompt_renders_conservative_instruction_set() -> None:
         competition_context="UEFA Champions League quarter-final",
         kickoff_context="20:00 WAT at Emirates Stadium",
         known_absences="Home: none confirmed. Away: one doubtful defender.",
+        fixture_details="lineups: Arsenal unchanged; Madrid rotate one defender.",
+        market_menu="1X2: Home 2.10 | Draw 3.40 | Away 3.20",
         recent_news_bullets="- Arsenal unbeaten in five\n- Madrid rotating after a derby",
         source_labels="BBC Sport, ESPN",
     )

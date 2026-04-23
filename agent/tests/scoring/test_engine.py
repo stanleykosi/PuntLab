@@ -297,8 +297,10 @@ def test_scoring_engine_selects_home_match_result_for_strong_home_edge() -> None
         h2h_data=(),
     )
 
-    assert score.recommended_market == MarketType.MATCH_RESULT
-    assert score.recommended_selection == "home"
+    assert score.recommended_market == "full_time_result"
+    assert score.recommended_market_label == "Full Time Result"
+    assert score.recommended_canonical_market is MarketType.MATCH_RESULT
+    assert score.recommended_selection == "Arsenal"
     assert score.recommended_odds == pytest.approx(1.64)
     assert score.composite_score > 0.55
     assert score.confidence > 0.60
@@ -400,10 +402,85 @@ def test_scoring_engine_prefers_totals_market_when_only_totals_are_scoreable() -
     engine = ScoringEngine()
     score = engine.calculate_match_score(fixture, stats, odds, injuries=(), h2h_data=None)
 
-    assert score.recommended_market == MarketType.TOTAL_POINTS
-    assert score.recommended_selection == "over"
+    assert score.recommended_market == "totals"
+    assert score.recommended_market_label == "Totals"
+    assert score.recommended_canonical_market is MarketType.TOTAL_POINTS
+    assert score.recommended_selection == "Over"
+    assert score.recommended_line == pytest.approx(228.5)
     assert score.recommended_odds == pytest.approx(1.96)
     assert score.confidence > 0.45
+
+
+def test_scoring_engine_uses_context_suggested_provider_market_for_unmapped_market() -> None:
+    """Research-suggested exotic SportyBet markets should be selectable as-is."""
+
+    fixture = build_fixture()
+    stats = (
+        build_team_stats(
+            team_id="arsenal",
+            team_name="Arsenal",
+            wins=7,
+            draws=2,
+            losses=1,
+            goals_for=22,
+            goals_against=10,
+            home_wins=4,
+            away_wins=3,
+        ),
+        build_team_stats(
+            team_id="chelsea",
+            team_name="Chelsea",
+            wins=4,
+            draws=3,
+            losses=3,
+            goals_for=15,
+            goals_against=13,
+            home_wins=3,
+            away_wins=1,
+        ),
+    )
+    odds = (
+        build_odds_row(
+            fixture_ref=fixture.get_fixture_ref(),
+            provider="sportybet",
+            provider_market_name="Team To Score First",
+            provider_selection_name="Arsenal",
+            odds=1.95,
+        ),
+        build_odds_row(
+            fixture_ref=fixture.get_fixture_ref(),
+            provider="sportybet",
+            provider_market_name="Team To Score First",
+            provider_selection_name="Chelsea",
+            odds=2.15,
+        ),
+    )
+    context_payload = build_context().model_dump()
+    context_payload.update(
+        {
+            "suggested_market": "team_to_score_first",
+            "suggested_market_label": "Team To Score First",
+            "suggested_selection": "Arsenal",
+            "suggested_odds": 1.95,
+        }
+    )
+    context = MatchContext.model_validate(context_payload)
+
+    engine = ScoringEngine()
+    score = engine.calculate_match_score(
+        fixture,
+        stats,
+        odds,
+        context=context,
+        injuries=(),
+        h2h_data=(),
+    )
+
+    assert score.recommended_market == "team_to_score_first"
+    assert score.recommended_market_label == "Team To Score First"
+    assert score.recommended_canonical_market is None
+    assert score.recommended_selection == "Arsenal"
+    assert score.recommended_odds == pytest.approx(1.95)
 
 
 def test_scoring_engine_handles_unscoreable_or_missing_odds_without_recommendation() -> None:
@@ -441,3 +518,49 @@ def test_scoring_engine_handles_unscoreable_or_missing_odds_without_recommendati
     assert score.recommended_odds is None
     assert score.factors.odds_value == pytest.approx(0.10)
     assert score.confidence < score.composite_score
+
+
+def test_scoring_engine_scores_fixture_conservatively_when_team_stats_are_missing() -> None:
+    """Missing exact team stats should keep scoring conservative and non-actionable."""
+
+    fixture = build_fixture()
+    odds = (
+        build_odds_row(
+            fixture_ref=fixture.get_fixture_ref(),
+            provider="Pinnacle",
+            provider_market_name="Full Time Result",
+            provider_selection_name="Arsenal",
+            odds=1.72,
+        ),
+        build_odds_row(
+            fixture_ref=fixture.get_fixture_ref(),
+            provider="Pinnacle",
+            provider_market_name="Full Time Result",
+            provider_selection_name="Draw",
+            odds=3.80,
+        ),
+        build_odds_row(
+            fixture_ref=fixture.get_fixture_ref(),
+            provider="Pinnacle",
+            provider_market_name="Full Time Result",
+            provider_selection_name="Chelsea",
+            odds=4.90,
+        ),
+    )
+
+    engine = ScoringEngine()
+    score = engine.calculate_match_score(
+        fixture,
+        (),
+        odds,
+        context=None,
+        injuries=None,
+        h2h_data=None,
+    )
+
+    assert score.recommended_market is None
+    assert score.recommended_selection is None
+    assert score.recommended_odds is None
+    assert score.factors.form == pytest.approx(0.5)
+    assert score.factors.venue == pytest.approx(0.5)
+    assert score.confidence < 0.6

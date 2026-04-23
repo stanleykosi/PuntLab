@@ -10,6 +10,7 @@ validation helpers from `src.schemas.common`.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from math import isclose
 from typing import Self
 
@@ -106,8 +107,39 @@ class MatchContext(BaseModel):
         default=None,
         description="Optional condensed summary of the supporting news context.",
     )
+    suggested_market: str | None = Field(
+        default=None,
+        description="Provider-native market key suggested from the supplied market menu.",
+    )
+    suggested_market_label: str | None = Field(
+        default=None,
+        description="Display label for the suggested provider market.",
+    )
+    suggested_canonical_market: MarketType | None = Field(
+        default=None,
+        description="Canonical market hint when the suggested market maps into PuntLab taxonomy.",
+    )
+    suggested_selection: str | None = Field(
+        default=None,
+        description="Exact provider-facing selection suggested from the market menu.",
+    )
+    suggested_odds: float | None = Field(
+        default=None,
+        gt=1.0,
+        description="Decimal odds tied to the suggested selection when present in the menu.",
+    )
+    suggested_line: float | None = Field(
+        default=None,
+        description="Numeric line associated with the suggested market when applicable.",
+    )
 
-    @field_validator("fixture_ref", "news_summary")
+    @field_validator(
+        "fixture_ref",
+        "news_summary",
+        "suggested_market",
+        "suggested_market_label",
+        "suggested_selection",
+    )
     @classmethod
     def validate_optional_text(cls, value: str | None) -> str | None:
         """Trim optional context text and collapse empties to `None`."""
@@ -128,11 +160,15 @@ class MatchContext(BaseModel):
         "pressure_home",
         "pressure_away",
         "qualitative_score",
+        "suggested_odds",
+        "suggested_line",
     )
     @classmethod
-    def validate_bounded_scores(cls, value: float, info: object) -> float:
+    def validate_bounded_scores(cls, value: float | None, info: object) -> float | None:
         """Reject non-finite scoring inputs before bound checks are trusted."""
 
+        if value is None:
+            return None
         field_name = getattr(info, "field_name", "value")
         return require_finite_number(value, field_name)
 
@@ -142,6 +178,23 @@ class MatchContext(BaseModel):
         """Require at least one unique source for qualitative context."""
 
         return _normalize_unique_sources(value)
+
+    @model_validator(mode="after")
+    def validate_suggested_market_shape(self) -> Self:
+        """Require coherent suggested-market fields when the model proposes one."""
+
+        if self.suggested_canonical_market is None and self.suggested_market is not None:
+            with suppress(ValueError):
+                self.suggested_canonical_market = MarketType(self.suggested_market)
+        if self.suggested_market is not None and self.suggested_selection is None:
+            raise ValueError(
+                "suggested_selection is required when suggested_market is provided."
+            )
+        if self.suggested_odds is not None and self.suggested_market is None:
+            raise ValueError(
+                "suggested_market is required when suggested_odds is provided."
+            )
+        return self
 
 
 class QualitativeScore(BaseModel):
@@ -399,18 +452,30 @@ class MatchScore(BaseModel):
     factors: ScoreFactorBreakdown = Field(
         description="Factor-level breakdown that produced the composite score.",
     )
-    recommended_market: MarketType | None = Field(
+    recommended_market: str | None = Field(
         default=None,
-        description="Best-fit market family selected by the scoring engine.",
+        description="Provider-native market key selected by the scoring engine.",
+    )
+    recommended_market_label: str | None = Field(
+        default=None,
+        description="Display label for the selected provider market.",
+    )
+    recommended_canonical_market: MarketType | None = Field(
+        default=None,
+        description="Canonical market hint when the selected market fits PuntLab taxonomy.",
     )
     recommended_selection: str | None = Field(
         default=None,
-        description="Best-fit selection within the recommended market.",
+        description="Best-fit provider-facing selection within the recommended market.",
     )
     recommended_odds: float | None = Field(
         default=None,
         gt=1.0,
         description="Decimal odds tied to the recommended selection when known.",
+    )
+    recommended_line: float | None = Field(
+        default=None,
+        description="Numeric line tied to the recommended market when known.",
     )
     qualitative_summary: str | None = Field(
         default=None,
@@ -430,14 +495,24 @@ class MatchScore(BaseModel):
         field_name = getattr(info, "field_name", "value")
         return require_non_blank_text(value, field_name)
 
-    @field_validator("recommended_selection", "qualitative_summary")
+    @field_validator(
+        "recommended_market",
+        "recommended_market_label",
+        "recommended_selection",
+        "qualitative_summary",
+    )
     @classmethod
     def validate_optional_text(cls, value: str | None) -> str | None:
         """Trim optional explanatory text and collapse empties to `None`."""
 
         return normalize_optional_text(value)
 
-    @field_validator("composite_score", "confidence", "recommended_odds")
+    @field_validator(
+        "composite_score",
+        "confidence",
+        "recommended_odds",
+        "recommended_line",
+    )
     @classmethod
     def validate_finite_score_fields(cls, value: float | None, info: object) -> float | None:
         """Reject non-finite composite, confidence, and odds values."""
@@ -453,6 +528,9 @@ class MatchScore(BaseModel):
 
         if self.home_team.casefold() == self.away_team.casefold():
             raise ValueError("home_team and away_team must describe different teams.")
+        if self.recommended_canonical_market is None and self.recommended_market is not None:
+            with suppress(ValueError):
+                self.recommended_canonical_market = MarketType(self.recommended_market)
         if self.recommended_market is not None and self.recommended_selection is None:
             raise ValueError(
                 "recommended_selection is required when recommended_market is provided."

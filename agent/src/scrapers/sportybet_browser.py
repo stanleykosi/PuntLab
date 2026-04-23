@@ -740,10 +740,13 @@ class SportyBetBrowserScraper:
                     requested_sportradar_id,
                 )
                 parsed_rows.extend(
-                    self._normalizer._parse_markets(
-                        event,
-                        sportradar_id=requested_sportradar_id,
-                        fixture=fixture,
+                    self._normalizer._tag_fetch_source(
+                        self._normalizer._parse_markets(
+                            event,
+                            sportradar_id=requested_sportradar_id,
+                            fixture=fixture,
+                        ),
+                        fetch_source="browser",
                     )
                 )
             except ProviderError as exc:
@@ -758,10 +761,13 @@ class SportyBetBrowserScraper:
                     url_context=url_context,
                 )
                 parsed_rows.extend(
-                    self._normalizer._parse_markets(
-                        dom_event,
-                        sportradar_id=requested_sportradar_id,
-                        fixture=fixture,
+                    self._normalizer._tag_fetch_source(
+                        self._normalizer._parse_markets(
+                            dom_event,
+                            sportradar_id=requested_sportradar_id,
+                            fixture=fixture,
+                        ),
+                        fetch_source="browser",
                     )
                 )
             except ProviderError as exc:

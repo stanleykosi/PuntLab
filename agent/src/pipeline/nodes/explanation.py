@@ -667,7 +667,7 @@ def _render_selection_summary(leg: AccumulatorLeg) -> str:
     """Render one human-readable selection summary for prompt grounding."""
 
     line_suffix = f" line {leg.line:+.1f}" if leg.line is not None else ""
-    market_label = leg.market_label or leg.market.value.replace("_", " ")
+    market_label = _display_market_label(leg)
     return (
         f"{market_label}: {leg.selection} @ {leg.odds:.2f} odds"
         f"{line_suffix} via {leg.provider}"
@@ -685,6 +685,16 @@ def _render_leg_score_summary(leg: AccumulatorLeg) -> str:
         f"resolution source {leg.resolution_source.value}; "
         f"existing edge summary: {evidence}"
     )
+
+
+def _display_market_label(leg: AccumulatorLeg) -> str:
+    """Return the best available market label for explanation prompts."""
+
+    if leg.market_label:
+        return leg.market_label
+    if leg.canonical_market is not None:
+        return leg.canonical_market.value.replace("_", " ")
+    return leg.market.replace("_", " ")
 
 
 def _render_leg_risk_notes(leg: AccumulatorLeg) -> str:
@@ -710,7 +720,7 @@ def _render_legs_summary(legs: Sequence[AccumulatorLeg]) -> str:
     return "\n".join(
         (
             f"{leg.leg_number}. {leg.fixture_label()} - {leg.selection} "
-            f"({leg.market.value}) @ {leg.odds:.2f}; "
+            f"({_display_market_label(leg)}) @ {leg.odds:.2f}; "
             f"confidence {leg.confidence:.2f}; "
             f"edge: {leg.rationale or 'No prior rationale available.'}"
         )
@@ -786,8 +796,8 @@ def _derive_leg_risk(leg: AccumulatorLeg) -> str | None:
 
     if leg.confidence < 0.60:
         return "Confidence is lower than the slate's top legs."
-    if leg.resolution_source.value == "external_odds":
-        return "This pick relies on external odds fallback rather than direct SportyBet resolution."
+    if leg.resolution_source.value == "sportybet_browser":
+        return "This pick relied on the slower SportyBet browser fallback rather than the API path."
     if leg.line is not None and leg.market in _LINE_MARKETS:
         return "Line-based markets can swing on narrow late margins."
     if leg.odds >= 2.40:
@@ -800,11 +810,8 @@ def _derive_accumulator_risk(slip: AccumulatorSlip) -> str | None:
 
     if slip.leg_count >= 5:
         return "More legs increase the chance that one volatile result breaks the slip."
-    if any(leg.resolution_source.value == "external_odds" for leg in slip.legs):
-        return (
-            "At least one leg depends on external-odds fallback instead of direct "
-            "SportyBet data."
-        )
+    if any(leg.resolution_source.value == "sportybet_browser" for leg in slip.legs):
+        return "At least one leg depended on SportyBet browser fallback instead of the API path."
     if any(leg.market in _LINE_MARKETS for leg in slip.legs):
         return "Line-based totals or handicap legs can turn on narrow margins."
     if slip.total_odds >= 8.0:

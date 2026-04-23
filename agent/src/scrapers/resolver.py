@@ -1,11 +1,11 @@
 """Canonical SportyBet market resolver for PuntLab's recommendation pipeline.
 
 Purpose: choose the best available bookmaker market for one analyzed fixture by
-trying the fast SportyBet API interceptor first, then the browser fallback, and
-finally a supplied pool of normalized external odds.
-Scope: fixture-aware source fallback, canonical market/selection matching,
-line-based tie breaking, and `ResolvedMarket` construction for downstream
-accumulator building.
+trying pre-fetched SportyBet rows first, then the fast SportyBet API
+interceptor, and finally the browser fallback.
+Scope: fixture-aware SportyBet source fallback, canonical market/selection
+matching, line-based tie breaking, and `ResolvedMarket` construction for
+downstream accumulator building.
 Dependencies: shared normalized fixture, odds, and analysis schemas plus the
 SportyBet HTTP and browser scrapers that provide bookmaker market snapshots.
 """
@@ -91,7 +91,7 @@ class MarketResolver:
         fixture: NormalizedFixture,
         analysis: MatchScore | RankedMatch,
         *,
-        external_odds: Sequence[NormalizedOdds] = (),
+        prefetched_rows: Sequence[NormalizedOdds] = (),
         use_cache: bool = True,
     ) -> ResolvedMarket:
         """Resolve the best matching market for one analyzed fixture.
@@ -100,9 +100,9 @@ class MarketResolver:
             fixture: Canonical fixture metadata for the scored match.
             analysis: Match scoring output containing the recommended market and
                 recommended selection to resolve.
-            external_odds: Optional fallback pool of normalized external odds.
-                Rows may already be pre-filtered or may represent a broader
-                slate; the resolver will match the relevant fixture rows.
+            prefetched_rows: Optional SportyBet rows already fetched earlier in
+                the pipeline. Rows may represent a broader slate; the resolver
+                will match only the relevant fixture rows.
             use_cache: Whether the SportyBet scrapers may reuse cached market
                 snapshots before fetching fresh data.
 
@@ -119,18 +119,59 @@ class MarketResolver:
 
         recommended_market = analysis.recommended_market
         recommended_selection = analysis.recommended_selection
+        recommended_canonical_market = (
+            analysis.recommended_canonical_market
+            or self._coerce_canonical_market(analysis.recommended_market)
+        )
+        recommended_line = analysis.recommended_line
         if recommended_market is None or recommended_selection is None:
             raise ValueError(
                 "analysis must include recommended_market and recommended_selection."
             )
 
-        normalized_target_selection, target_line = self._normalize_target_selection(
-            recommended_selection,
-            market=recommended_market,
-            fixture=fixture,
-        )
+        target_line = recommended_line
+        normalized_target_selection = recommended_selection
+        if recommended_canonical_market is not None:
+            normalized_target_selection, inferred_line = self._normalize_target_selection(
+                recommended_selection,
+                market=recommended_canonical_market,
+                fixture=fixture,
+            )
+            if target_line is None:
+                target_line = inferred_line
         sportybet_url = self._build_sportybet_url(fixture)
         diagnostics: list[str] = []
+
+        resolved_prefetched_market = self._select_exact_resolved_market(
+            rows=prefetched_rows,
+            fixture=fixture,
+            market_key=recommended_market,
+            selection=recommended_selection,
+            target_line=target_line,
+            recommended_odds=analysis.recommended_odds,
+            default_resolution_source=ResolutionSource.SPORTYBET_API,
+            sportybet_url=sportybet_url,
+        )
+        if resolved_prefetched_market is not None:
+            return resolved_prefetched_market
+        if recommended_canonical_market is not None:
+            resolved_prefetched_market = self._select_canonical_resolved_market(
+                rows=prefetched_rows,
+                fixture=fixture,
+                market=recommended_canonical_market,
+                normalized_selection=normalized_target_selection,
+                target_line=target_line,
+                recommended_odds=analysis.recommended_odds,
+                default_resolution_source=ResolutionSource.SPORTYBET_API,
+                sportybet_url=sportybet_url,
+            )
+            if resolved_prefetched_market is not None:
+                return resolved_prefetched_market
+        if prefetched_rows:
+            diagnostics.append(
+                "Prefetched SportyBet rows did not contain the recommended market and selection "
+                "for the fixture."
+            )
 
         if fixture.sportradar_id is not None:
             try:
@@ -142,21 +183,34 @@ class MarketResolver:
             except ProviderError as exc:
                 diagnostics.append(f"SportyBet API failed: {exc}")
             else:
-                resolved_api_market = self._select_resolved_market(
+                resolved_api_market = self._select_exact_resolved_market(
                     rows=api_rows,
                     fixture=fixture,
-                    market=recommended_market,
-                    normalized_selection=normalized_target_selection,
+                    market_key=recommended_market,
+                    selection=recommended_selection,
                     target_line=target_line,
                     recommended_odds=analysis.recommended_odds,
-                    resolution_source=ResolutionSource.SPORTYBET_API,
+                    default_resolution_source=ResolutionSource.SPORTYBET_API,
                     sportybet_url=sportybet_url,
                 )
                 if resolved_api_market is not None:
                     return resolved_api_market
+                if recommended_canonical_market is not None:
+                    resolved_api_market = self._select_canonical_resolved_market(
+                        rows=api_rows,
+                        fixture=fixture,
+                        market=recommended_canonical_market,
+                        normalized_selection=normalized_target_selection,
+                        target_line=target_line,
+                        recommended_odds=analysis.recommended_odds,
+                        default_resolution_source=ResolutionSource.SPORTYBET_API,
+                        sportybet_url=sportybet_url,
+                    )
+                    if resolved_api_market is not None:
+                        return resolved_api_market
                 diagnostics.append(
                     "SportyBet API returned markets, but none matched the recommended "
-                    f"market `{recommended_market.value}` and selection `{recommended_selection}`."
+                    f"market `{recommended_market}` and selection `{recommended_selection}`."
                 )
 
             if sportybet_url is not None:
@@ -169,21 +223,34 @@ class MarketResolver:
                 except ProviderError as exc:
                     diagnostics.append(f"SportyBet browser fallback failed: {exc}")
                 else:
-                    resolved_browser_market = self._select_resolved_market(
+                    resolved_browser_market = self._select_exact_resolved_market(
                         rows=browser_rows,
                         fixture=fixture,
-                        market=recommended_market,
-                        normalized_selection=normalized_target_selection,
+                        market_key=recommended_market,
+                        selection=recommended_selection,
                         target_line=target_line,
                         recommended_odds=analysis.recommended_odds,
-                        resolution_source=ResolutionSource.SPORTYBET_BROWSER,
+                        default_resolution_source=ResolutionSource.SPORTYBET_BROWSER,
                         sportybet_url=sportybet_url,
                     )
                     if resolved_browser_market is not None:
                         return resolved_browser_market
+                    if recommended_canonical_market is not None:
+                        resolved_browser_market = self._select_canonical_resolved_market(
+                            rows=browser_rows,
+                            fixture=fixture,
+                            market=recommended_canonical_market,
+                            normalized_selection=normalized_target_selection,
+                            target_line=target_line,
+                            recommended_odds=analysis.recommended_odds,
+                            default_resolution_source=ResolutionSource.SPORTYBET_BROWSER,
+                            sportybet_url=sportybet_url,
+                        )
+                        if resolved_browser_market is not None:
+                            return resolved_browser_market
                     diagnostics.append(
                         "SportyBet browser fallback returned markets, but none matched the "
-                        f"recommended market `{recommended_market.value}` and selection "
+                        f"recommended market `{recommended_market}` and selection "
                         f"`{recommended_selection}`."
                     )
             else:
@@ -196,28 +263,15 @@ class MarketResolver:
                 "SportyBet resolution was skipped because fixture.sportradar_id is missing."
             )
 
-        resolved_external_market = self._select_resolved_market(
-            rows=external_odds,
-            fixture=fixture,
-            market=recommended_market,
-            normalized_selection=normalized_target_selection,
-            target_line=target_line,
-            recommended_odds=analysis.recommended_odds,
-            resolution_source=ResolutionSource.EXTERNAL_ODDS,
-            sportybet_url=sportybet_url,
-        )
-        if resolved_external_market is not None:
-            return resolved_external_market
-
         diagnostics.append(
-            "External odds fallback did not contain a compatible canonical market for the fixture."
+            "No SportyBet source produced a compatible market for the fixture."
         )
         raise ProviderError(
             "market-resolver",
             (
                 "Could not resolve a bookmaker market for fixture "
                 f"{fixture.get_fixture_ref()} ({fixture.home_team} vs {fixture.away_team}). "
-                f"Recommended market: `{recommended_market.value}`. "
+                f"Recommended market: `{recommended_market}`. "
                 f"Recommended selection: `{recommended_selection}`. "
                 f"Diagnostics: {' | '.join(diagnostics)}"
             ),
@@ -233,7 +287,50 @@ class MarketResolver:
         if self._owns_cache and self._cache is not None:
             await self._cache.close()
 
-    def _select_resolved_market(
+    def _select_exact_resolved_market(
+        self,
+        *,
+        rows: Sequence[NormalizedOdds],
+        fixture: NormalizedFixture,
+        market_key: str,
+        selection: str,
+        target_line: float | None,
+        recommended_odds: float | None,
+        default_resolution_source: ResolutionSource,
+        sportybet_url: str | None,
+    ) -> ResolvedMarket | None:
+        """Filter, rank, and materialize the exact provider-native recommendation."""
+
+        matching_rows = self._exact_matching_rows(
+            rows=rows,
+            fixture=fixture,
+            market_key=market_key,
+            selection=selection,
+            target_line=target_line,
+        )
+        if not matching_rows:
+            return None
+
+        best_row = min(
+            matching_rows,
+            key=lambda row: self._candidate_sort_key(
+                row=row,
+                canonical_market=row.market,
+                target_line=target_line,
+                recommended_odds=recommended_odds,
+            ),
+        )
+        return self._build_resolved_market(
+            row=best_row,
+            fixture=fixture,
+            resolution_source=self._resolution_source_for_row(
+                best_row,
+                default_source=default_resolution_source,
+            ),
+            sportybet_url=sportybet_url,
+        )
+
+    def _select_canonical_resolved_market(
         self,
         *,
         rows: Sequence[NormalizedOdds],
@@ -242,10 +339,10 @@ class MarketResolver:
         normalized_selection: str,
         target_line: float | None,
         recommended_odds: float | None,
-        resolution_source: ResolutionSource,
+        default_resolution_source: ResolutionSource,
         sportybet_url: str | None,
     ) -> ResolvedMarket | None:
-        """Filter, rank, and materialize the best candidate from one source."""
+        """Filter, rank, and materialize the best canonical candidate from one source."""
 
         matching_rows = self._matching_rows(
             rows=rows,
@@ -261,15 +358,18 @@ class MarketResolver:
             matching_rows,
             key=lambda row: self._candidate_sort_key(
                 row=row,
-                market=market,
+                canonical_market=market,
+                target_line=target_line,
                 recommended_odds=recommended_odds,
             ),
         )
         return self._build_resolved_market(
             row=best_row,
             fixture=fixture,
-            market=market,
-            resolution_source=resolution_source,
+            resolution_source=self._resolution_source_for_row(
+                best_row,
+                default_source=default_resolution_source,
+            ),
             sportybet_url=sportybet_url,
         )
 
@@ -311,12 +411,47 @@ class MarketResolver:
             matching_rows.append(row)
         return tuple(matching_rows)
 
+    def _exact_matching_rows(
+        self,
+        *,
+        rows: Sequence[NormalizedOdds],
+        fixture: NormalizedFixture,
+        market_key: str,
+        selection: str,
+        target_line: float | None,
+    ) -> tuple[NormalizedOdds, ...]:
+        """Return source rows that exactly match the provider-native recommendation."""
+
+        relevant_rows = tuple(row for row in rows if self._row_matches_fixture(row, fixture))
+        if not relevant_rows:
+            return ()
+
+        normalized_market_key = self._normalize_key(market_key)
+        normalized_selection_key = self._normalize_key(selection)
+        matching_rows: list[NormalizedOdds] = []
+        for row in relevant_rows:
+            row_market_key = row.provider_market_key or self._normalize_key(row.provider_market_name)
+            if row_market_key != normalized_market_key:
+                continue
+
+            selection_matches = (
+                row.provider_selection_key == normalized_selection_key
+                or self._normalize_key(row.provider_selection_name) == normalized_selection_key
+                or self._normalize_key(row.selection) == normalized_selection_key
+            )
+            if not selection_matches:
+                continue
+            if target_line is not None:
+                if row.line is None or not isclose(row.line, target_line, abs_tol=_LINE_TOLERANCE):
+                    continue
+            matching_rows.append(row)
+        return tuple(matching_rows)
+
     def _build_resolved_market(
         self,
         *,
         row: NormalizedOdds,
         fixture: NormalizedFixture,
-        market: MarketType,
         resolution_source: ResolutionSource,
         sportybet_url: str | None,
     ) -> ResolvedMarket:
@@ -324,8 +459,9 @@ class MarketResolver:
 
         return ResolvedMarket(
             fixture_ref=fixture.get_fixture_ref(),
-            market=market,
-            selection=row.selection,
+            market=row.provider_market_key or self._normalize_key(row.provider_market_name),
+            canonical_market=row.market,
+            selection=row.provider_selection_name,
             odds=row.odds,
             provider=row.provider,
             provider_market_name=row.provider_market_name,
@@ -354,7 +490,8 @@ class MarketResolver:
         self,
         *,
         row: NormalizedOdds,
-        market: MarketType,
+        canonical_market: MarketType | None,
+        target_line: float | None,
         recommended_odds: float | None,
     ) -> tuple[float, float, float]:
         """Rank matching rows so the resolver picks the most faithful candidate."""
@@ -364,7 +501,14 @@ class MarketResolver:
             if recommended_odds is not None
             else 0.0
         )
-        if market in _LINE_BASED_MARKETS:
+        if target_line is not None:
+            line_delta = (
+                abs(row.line - target_line)
+                if row.line is not None
+                else float("inf")
+            )
+            return (odds_delta, line_delta, -row.odds)
+        if canonical_market in _LINE_BASED_MARKETS:
             line_magnitude = abs(row.line) if row.line is not None else float("inf")
             return (odds_delta, line_magnitude, -row.odds)
         return (odds_delta, 0.0, -row.odds)
@@ -437,6 +581,21 @@ class MarketResolver:
         if isinstance(row.provider_market_id, str) and row.provider_market_id.strip().isdigit():
             return int(row.provider_market_id.strip())
         return None
+
+    @staticmethod
+    def _resolution_source_for_row(
+        row: NormalizedOdds,
+        *,
+        default_source: ResolutionSource,
+    ) -> ResolutionSource:
+        """Derive the true SportyBet source from preserved fetch metadata."""
+
+        fetch_source = row.raw_metadata.get("sportybet_fetch_source")
+        if fetch_source == "browser":
+            return ResolutionSource.SPORTYBET_BROWSER
+        if fetch_source == "api":
+            return ResolutionSource.SPORTYBET_API
+        return default_source
 
     def _normalize_target_selection(
         self,
@@ -530,6 +689,17 @@ class MarketResolver:
             return None
         try:
             return float(match.group(0))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _coerce_canonical_market(value: str | None) -> MarketType | None:
+        """Convert one string recommendation into a canonical market when possible."""
+
+        if value is None:
+            return None
+        try:
+            return MarketType(value)
         except ValueError:
             return None
 

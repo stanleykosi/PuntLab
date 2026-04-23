@@ -14,13 +14,20 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import MarketType, SportName
 from src.schemas.common import normalize_optional_text, require_non_blank_text
+from src.schemas.fixtures import NormalizedFixture
+from src.schemas.market_snapshot import (
+    FixtureMarketGroupSnapshot,
+    FixtureMarketSelection,
+    FixtureMarketSnapshot,
+    FixtureMarketSnapshotEntry,
+)
 from src.schemas.odds import JSONPrimitive, NormalizedOdds
 
 _NON_ALNUM_PATTERN: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
@@ -300,6 +307,48 @@ class OddsMarketCatalog(BaseModel):
             if not selection.is_scoreable
         )
 
+    def fixture_snapshots(
+        self,
+        fixtures: Sequence[NormalizedFixture],
+    ) -> tuple[FixtureMarketSnapshot, ...]:
+        """Build compact fixture-scoped market views without duplicating storage.
+
+        Inputs:
+            fixtures: Ordered fixture slate whose identity fields should be
+                preserved in the derived snapshots.
+
+        Outputs:
+            A tuple of per-fixture market snapshots built from this catalog in
+            fixture order, with empty snapshots included when a fixture has no
+            fetched markets.
+        """
+
+        grouped_markets = group_markets_by_fixture(self.markets)
+        snapshots: list[FixtureMarketSnapshot] = []
+        seen_fixture_refs: set[str] = set()
+
+        for fixture in fixtures:
+            fixture_ref = fixture.get_fixture_ref()
+            seen_fixture_refs.add(fixture_ref)
+            snapshots.append(
+                _build_fixture_market_snapshot(
+                    fixture=fixture,
+                    markets=grouped_markets.get(fixture_ref, ()),
+                )
+            )
+
+        for fixture_ref, markets in grouped_markets.items():
+            if fixture_ref in seen_fixture_refs:
+                continue
+            snapshots.append(
+                _build_fixture_market_snapshot(
+                    fixture=_fallback_fixture_from_markets(fixture_ref, markets),
+                    markets=markets,
+                )
+            )
+
+        return tuple(snapshots)
+
 
 def build_odds_market_catalog(
     odds_rows: Sequence[NormalizedOdds],
@@ -457,6 +506,218 @@ def group_markets_by_canonical_market(
         for represented_market in represented_markets:
             grouped.setdefault(represented_market, []).append(market)
     return {market_type: tuple(entries) for market_type, entries in grouped.items()}
+
+
+def build_fixture_market_snapshots(
+    fixtures: Sequence[NormalizedFixture],
+    catalog: OddsMarketCatalog,
+) -> tuple[FixtureMarketSnapshot, ...]:
+    """Build fixture-scoped market snapshots from the canonical odds catalog."""
+
+    return catalog.fixture_snapshots(fixtures)
+
+
+def _build_fixture_market_snapshot(
+    *,
+    fixture: NormalizedFixture,
+    markets: Sequence[ProviderMarketCatalogEntry],
+) -> FixtureMarketSnapshot:
+    """Build one compact fixture market snapshot from grouped catalog entries."""
+
+    group_entries: dict[tuple[str, str], list[FixtureMarketSnapshotEntry]] = {}
+    group_order: list[tuple[str, str]] = []
+    reported_total_market_size: int | None = None
+    event_id: str | None = None
+    game_id: str | None = None
+    fetch_source: str | None = None
+    provider = "sportybet"
+    fetched_selection_count = 0
+    scoreable_market_count = 0
+    scoreable_selection_count = 0
+
+    for market in markets:
+        provider = market.provider
+        if event_id is None:
+            event_id = _extract_optional_metadata_text(market.raw_metadata, "event_id")
+        if game_id is None:
+            game_id = _extract_optional_metadata_text(market.raw_metadata, "game_id")
+        if fetch_source is None:
+            fetch_source = _extract_optional_metadata_text(
+                market.raw_metadata,
+                "sportybet_fetch_source",
+            )
+        if reported_total_market_size is None:
+            reported_total_market_size = _extract_optional_metadata_int(
+                market.raw_metadata,
+                "event_total_market_size",
+            )
+
+        group_id = (
+            _extract_optional_metadata_text(market.raw_metadata, "market_group_id")
+            or "ungrouped"
+        )
+        group_name = (
+            _extract_optional_metadata_text(market.raw_metadata, "market_group_name")
+            or "Ungrouped"
+        )
+        group_key = (group_id, group_name)
+        if group_key not in group_entries:
+            group_entries[group_key] = []
+            group_order.append(group_key)
+
+        selections = tuple(
+            FixtureMarketSelection(
+                provider_selection_name=selection.source.provider_selection_name,
+                odds=selection.source.odds,
+                line=selection.source.line,
+                canonical_market=selection.canonical_market,
+                canonical_selection=(
+                    selection.canonical_selection if selection.is_scoreable else None
+                ),
+                provider_selection_id=selection.provider_selection_id,
+                is_scoreable=selection.is_scoreable,
+            )
+            for selection in market.selections
+        )
+        fetched_selection_count += len(selections)
+        market_scoreable_selection_count = sum(
+            1 for selection in selections if selection.is_scoreable
+        )
+        if market_scoreable_selection_count > 0:
+            scoreable_market_count += 1
+            scoreable_selection_count += market_scoreable_selection_count
+
+        group_entries[group_key].append(
+            FixtureMarketSnapshotEntry(
+                provider_market_name=market.provider_market_name,
+                provider_market_key=market.provider_market_key,
+                market_label=market.market_label,
+                provider_market_id=market.provider_market_id,
+                period=market.period,
+                participant_scope=market.participant_scope,
+                canonical_markets=market.scoreable_market_types(),
+                selections=selections,
+            )
+        )
+
+    market_groups = tuple(
+        FixtureMarketGroupSnapshot(
+            group_id=group_id,
+            group_name=group_name,
+            markets=tuple(group_entries[(group_id, group_name)]),
+        )
+        for group_id, group_name in group_order
+    )
+    fetched_market_count = len(markets)
+    total_market_size = (
+        reported_total_market_size
+        if reported_total_market_size is not None
+        else fetched_market_count
+    )
+
+    return FixtureMarketSnapshot(
+        fixture_ref=markets[0].fixture_ref if markets else fixture.get_fixture_ref(),
+        sport=fixture.sport,
+        competition=fixture.competition,
+        home_team=fixture.home_team,
+        away_team=fixture.away_team,
+        provider=provider,
+        event_id=event_id,
+        game_id=game_id,
+        fetch_source=fetch_source,
+        total_market_size=total_market_size,
+        reported_total_market_size=reported_total_market_size,
+        fetched_market_count=fetched_market_count,
+        fetched_selection_count=fetched_selection_count,
+        scoreable_market_count=scoreable_market_count,
+        scoreable_selection_count=scoreable_selection_count,
+        unmapped_market_count=max(0, fetched_market_count - scoreable_market_count),
+        market_groups=market_groups,
+    )
+
+
+def _fallback_fixture_from_markets(
+    fixture_ref: str,
+    markets: Sequence[ProviderMarketCatalogEntry],
+) -> NormalizedFixture:
+    """Build a conservative fixture shell when markets exist without a fixture row."""
+
+    competition = "Unknown Competition"
+    home_team = "Unknown Home"
+    away_team = "Unknown Away"
+    sport = SportName.SOCCER
+
+    for market in markets:
+        competition = (
+            _extract_optional_metadata_text(market.raw_metadata, "competition")
+            or competition
+        )
+        home_team = (
+            _extract_optional_metadata_text(market.raw_metadata, "home_team")
+            or home_team
+        )
+        away_team = (
+            _extract_optional_metadata_text(market.raw_metadata, "away_team")
+            or away_team
+        )
+        resolved_sport = _resolve_sport_from_market(market)
+        if resolved_sport is not None:
+            sport = resolved_sport
+            break
+
+    return NormalizedFixture(
+        sportradar_id=fixture_ref if fixture_ref.startswith("sr:match:") else None,
+        home_team=home_team,
+        away_team=away_team,
+        competition=competition,
+        sport=sport,
+        kickoff=datetime.fromtimestamp(0, tz=UTC),
+        source_provider="sportybet",
+        source_id=fixture_ref,
+    )
+
+
+def _resolve_sport_from_market(
+    market: ProviderMarketCatalogEntry,
+) -> SportName | None:
+    """Infer one fixture sport from the first available market selection."""
+
+    for selection in market.selections:
+        resolved = _resolve_sport(selection.source, explicit_sport=None)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _extract_optional_metadata_text(
+    raw_metadata: Mapping[str, JSONPrimitive],
+    key: str,
+) -> str | None:
+    """Return one optional stripped string from shared market metadata."""
+
+    value = raw_metadata.get(key)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, int):
+        return str(value)
+    return None
+
+
+def _extract_optional_metadata_int(
+    raw_metadata: Mapping[str, JSONPrimitive],
+    key: str,
+) -> int | None:
+    """Return one optional non-negative integer from shared market metadata."""
+
+    value = raw_metadata.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 def _build_selection_catalog_entry(
@@ -944,6 +1205,7 @@ __all__ = [
     "CanonicalOddsSelection",
     "OddsMarketCatalog",
     "ProviderMarketCatalogEntry",
+    "build_fixture_market_snapshots",
     "build_odds_market_catalog",
     "canonicalize_odds_rows",
     "filter_scoreable_odds",

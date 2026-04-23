@@ -13,10 +13,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from src.config import SUPPORTED_COMPETITIONS, CompetitionConfig
 from src.pipeline.state import PipelineStage, PipelineState
 from src.providers.odds_mapping import OddsMarketCatalog
 from src.providers.orchestrator import (
+    FixtureDetailsFetchResult,
     InjuryFetchResult,
     OddsFetchResult,
     ProviderOrchestrator,
@@ -78,17 +78,6 @@ def _extend_errors(state_errors: Sequence[str], *diagnostic_groups: Sequence[str
 
     return merged_errors
 
-
-def _eligible_competitions() -> tuple[CompetitionConfig, ...]:
-    """Return the canonical competition slate enabled for daily ingestion."""
-
-    return tuple(
-        competition
-        for competition in SUPPORTED_COMPETITIONS
-        if competition.include_in_daily_analysis
-    )
-
-
 async def ingestion_node(
     state: PipelineState | Mapping[str, Any],
     *,
@@ -115,9 +104,11 @@ async def ingestion_node(
 
     fixtures = await stage_orchestrator.fetch_fixtures(
         run_date=validated_state.run_date,
-        competitions=_eligible_competitions(),
     )
     odds_result = await stage_orchestrator.fetch_odds(fixtures=fixtures)
+    fixture_details_result = await stage_orchestrator.fetch_fixture_details(
+        fixtures=fixtures,
+    )
     stats_result = await stage_orchestrator.fetch_stats(fixtures=fixtures)
     injuries_result = await stage_orchestrator.fetch_injuries(fixtures=fixtures)
     news_articles = await stage_orchestrator.fetch_news(fixtures=fixtures)
@@ -132,6 +123,7 @@ async def ingestion_node(
     diagnostics = _build_ingestion_diagnostics(
         odds_result=odds_result,
         stats_result=stats_result,
+        fixture_details_result=fixture_details_result,
         injuries_result=injuries_result,
         fixture_count=len(fixtures),
         run_date=validated_state.run_date.isoformat(),
@@ -146,6 +138,7 @@ async def ingestion_node(
         "odds_data": list(odds_result.catalog.scoreable_rows()),
         "team_stats": list(stats_result.team_stats),
         "player_stats": list(stats_result.player_stats),
+        "fixture_details": list(fixture_details_result.fixture_details),
         "injuries": list(injuries_result.injuries),
         "news_articles": merged_news_articles,
         "errors": _extend_errors(
@@ -159,6 +152,7 @@ def _build_ingestion_diagnostics(
     *,
     odds_result: OddsFetchResult,
     stats_result: StatsFetchResult,
+    fixture_details_result: FixtureDetailsFetchResult,
     injuries_result: InjuryFetchResult,
     fixture_count: int,
     run_date: str,
@@ -184,6 +178,7 @@ def _build_ingestion_diagnostics(
 
     diagnostics.extend(odds_result.warnings)
     diagnostics.extend(stats_result.warnings)
+    diagnostics.extend(fixture_details_result.warnings)
     diagnostics.extend(injuries_result.warnings)
 
     if odds_result.unmatched_fixture_refs:
@@ -194,8 +189,8 @@ def _build_ingestion_diagnostics(
 
     if odds_result.catalog.unmapped_rows():
         diagnostics.append(
-            "Preserved unmapped odds markets remain outside the current canonical scoring "
-            "taxonomy."
+            "Preserved unmapped odds markets are available to research and provider-native "
+            "resolution, but they remain outside the deterministic scoreable taxonomy."
         )
 
     # The node surfaces provider warnings as explicit diagnostics because later

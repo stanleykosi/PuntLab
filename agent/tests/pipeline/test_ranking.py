@@ -146,3 +146,47 @@ async def test_ranking_node_breaks_ties_by_confidence_then_fixture_ref() -> None
         "sr:match:7009",
     ]
     assert [match.rank for match in ranked_matches] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_ranking_node_skips_scores_without_recommendations() -> None:
+    """Only actionable scored fixtures should advance to market resolution."""
+
+    actionable_score = build_match_score(
+        fixture_ref="sr:match:7011",
+        home_team="Arsenal",
+        away_team="Chelsea",
+        composite_score=0.81,
+        confidence=0.74,
+    )
+    informational_score = build_match_score(
+        fixture_ref="sr:match:7012",
+        home_team="Tottenham",
+        away_team="Liverpool",
+        composite_score=0.83,
+        confidence=0.78,
+    ).model_copy(
+        update={
+            "recommended_market": None,
+            "recommended_selection": None,
+            "recommended_odds": None,
+        }
+    )
+
+    result = await ranking_node(
+        PipelineState(
+            run_id="run-2026-04-04-filtered",
+            run_date=date(2026, 4, 4),
+            started_at=datetime(2026, 4, 4, 7, 45, tzinfo=UTC),
+            current_stage=PipelineStage.RANKING,
+            match_scores=[actionable_score, informational_score],
+            errors=["Scoring completed."],
+        )
+    )
+
+    assert [match.fixture_ref for match in result["ranked_matches"]] == ["sr:match:7011"]
+    assert [match.rank for match in result["ranked_matches"]] == [1]
+    assert result["errors"] == [
+        "Scoring completed.",
+        "Ranking skipped 1 scored fixture without a recommended market selection.",
+    ]

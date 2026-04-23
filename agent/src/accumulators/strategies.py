@@ -42,9 +42,8 @@ _UTILITY_WEIGHTS: Final[
     AccumulatorStrategy.AGGRESSIVE: (0.34, 0.16, 0.08, 0.42),
 }
 _RESOLUTION_PRIORITY: Final[dict[ResolutionSource, int]] = {
-    ResolutionSource.SPORTYBET_API: 3,
-    ResolutionSource.SPORTYBET_BROWSER: 2,
-    ResolutionSource.EXTERNAL_ODDS: 1,
+    ResolutionSource.SPORTYBET_API: 2,
+    ResolutionSource.SPORTYBET_BROWSER: 1,
 }
 _MAX_SELECTION_ATTEMPTS: Final[int] = 9
 
@@ -451,6 +450,7 @@ def _build_accumulator_leg(candidate: _LegCandidate, *, leg_number: int) -> Accu
         home_team=ranked_match.home_team,
         away_team=ranked_match.away_team,
         market=resolved_market.market,
+        canonical_market=resolved_market.canonical_market,
         selection=resolved_market.selection,
         odds=resolved_market.odds,
         provider=resolved_market.provider,

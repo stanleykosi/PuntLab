@@ -23,7 +23,7 @@ def test_normalized_odds_serializes_market_enum_and_provider_metadata() -> None:
         market=MarketType.MATCH_RESULT,
         selection="home",
         odds=1.82,
-        provider="the-odds-api",
+        provider="sportybet",
         provider_market_name="Full Time Result",
         provider_selection_name="Home",
         sportybet_available=True,
