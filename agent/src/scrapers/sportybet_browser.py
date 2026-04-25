@@ -13,6 +13,7 @@ schemas shared across the agent pipeline.
 from __future__ import annotations
 
 import itertools
+import logging
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
@@ -37,6 +38,7 @@ from src.scrapers.sportybet_api import (
     SportyBetMarketCacheEntry,
 )
 
+logger = logging.getLogger(__name__)
 _SPORTRADAR_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"sr:match:\d+")
 _TEAM_SEPARATOR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?i)(?:_vs_|-vs-| vs | v )")
 DEFAULT_MARKET_WAIT_SELECTORS: Final[tuple[str, ...]] = (
@@ -873,7 +875,18 @@ class SportyBetBrowserScraper:
         """Load one cached SportyBet market snapshot from Redis when present."""
 
         cache_key = RedisClient.build_sportybet_markets_key(sportradar_id)
-        cached_snapshot = await self._cache.get(cache_key, model=SportyBetMarketCacheEntry)
+        try:
+            cached_snapshot = await self._cache.get(
+                cache_key,
+                model=SportyBetMarketCacheEntry,
+            )
+        except Exception as exc:
+            logger.warning(
+                "SportyBet browser market cache read skipped for %s: %s",
+                sportradar_id,
+                exc,
+            )
+            return None
         if not isinstance(cached_snapshot, SportyBetMarketCacheEntry):
             return None
         return cached_snapshot.markets
@@ -891,7 +904,14 @@ class SportyBetBrowserScraper:
             fetched_at=self._clock().astimezone(UTC),
             markets=tuple(markets),
         )
-        await self._cache.set(cache_key, snapshot)
+        try:
+            await self._cache.set(cache_key, snapshot)
+        except Exception as exc:
+            logger.warning(
+                "SportyBet browser market cache write skipped for %s: %s",
+                sportradar_id,
+                exc,
+            )
 
     @staticmethod
     def _dedupe_rows(markets: Sequence[NormalizedOdds]) -> tuple[NormalizedOdds, ...]:

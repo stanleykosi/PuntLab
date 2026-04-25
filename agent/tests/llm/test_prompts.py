@@ -11,11 +11,14 @@ from __future__ import annotations
 import pytest
 from langchain_core.prompts import ChatPromptTemplate
 from src.llm.prompts import (
+    ACCUMULATOR_BUILDER_PROMPT,
     ACCUMULATOR_RATIONALE_PROMPT,
-    LEG_RATIONALE_PROMPT,
+    MARKET_RESOLUTION_PROMPT,
+    MARKET_SCORING_PROMPT,
     NEWS_CONTEXT_ANALYSIS_PROMPT,
     PROMPT_REGISTRY,
     QUALITATIVE_ASSESSMENT_PROMPT,
+    RANKING_PROMPT,
     get_prompt,
     resolve_prompt_task,
 )
@@ -26,7 +29,9 @@ def test_get_prompt_accepts_shared_task_aliases() -> None:
 
     assert get_prompt("news_context_analysis") is NEWS_CONTEXT_ANALYSIS_PROMPT
     assert get_prompt("qualitative_score") is QUALITATIVE_ASSESSMENT_PROMPT
-    assert get_prompt("leg_explanation") is LEG_RATIONALE_PROMPT
+    assert get_prompt("scoring") is MARKET_SCORING_PROMPT
+    assert get_prompt("resolve_market") is MARKET_RESOLUTION_PROMPT
+    assert get_prompt("accumulator_building") is ACCUMULATOR_BUILDER_PROMPT
     assert get_prompt("accumulator_explanation") is ACCUMULATOR_RATIONALE_PROMPT
 
 
@@ -48,7 +53,6 @@ def test_resolve_prompt_task_rejects_unknown_values() -> None:
                 "fixture_details",
                 "kickoff_context",
                 "known_absences",
-                "market_menu",
                 "recent_news_bullets",
                 "run_date",
                 "source_labels",
@@ -66,8 +70,26 @@ def test_resolve_prompt_task_rejects_unknown_values() -> None:
             },
         ),
         (
-            LEG_RATIONALE_PROMPT,
-            {"fixture_summary", "risk_notes", "score_summary", "selection_summary"},
+            MARKET_SCORING_PROMPT,
+            {
+                "fixture_summary",
+                "fixture_details",
+                "known_absences",
+                "market_menu",
+                "match_context_summary",
+            },
+        ),
+        (
+            RANKING_PROMPT,
+            {"run_date", "score_menu"},
+        ),
+        (
+            MARKET_RESOLUTION_PROMPT,
+            {"ranked_match_summary", "row_menu"},
+        ),
+        (
+            ACCUMULATOR_BUILDER_PROMPT,
+            {"resolved_leg_menu", "run_date", "target_count"},
         ),
         (
             ACCUMULATOR_RATIONALE_PROMPT,
@@ -94,7 +116,6 @@ def test_research_prompt_renders_conservative_instruction_set() -> None:
         kickoff_context="20:00 WAT at Emirates Stadium",
         known_absences="Home: none confirmed. Away: one doubtful defender.",
         fixture_details="lineups: Arsenal unchanged; Madrid rotate one defender.",
-        market_menu="1X2: Home 2.10 | Draw 3.40 | Away 3.20",
         recent_news_bullets="- Arsenal unbeaten in five\n- Madrid rotating after a derby",
         source_labels="BBC Sport, ESPN",
     )
@@ -102,7 +123,8 @@ def test_research_prompt_renders_conservative_instruction_set() -> None:
     assert len(messages) == 2
     assert "Never invent injuries" in messages[0].content
     assert "Arsenal vs Real Madrid" in messages[1].content
-    assert "score conservatively" in messages[1].content.lower()
+    assert "SportyBet fixture-page details" in messages[1].content
+    assert "fixture_detail_summary" in messages[1].content
 
 
 def test_accumulator_prompt_mentions_shared_risk_and_plain_text_output() -> None:
@@ -131,6 +153,9 @@ def test_prompt_registry_only_contains_supported_canonical_tasks() -> None:
     assert set(PROMPT_REGISTRY) == {
         "research",
         "qualitative_assessment",
-        "leg_rationale",
+        "market_scoring",
+        "ranking",
+        "market_resolution",
+        "accumulator_builder",
         "accumulator_rationale",
     }

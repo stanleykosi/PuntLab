@@ -237,6 +237,7 @@ class StubSportyBetFixtureStatsScraper:
     errors_by_url: dict[str, RuntimeError] = field(default_factory=dict)
     transient_errors_by_url: dict[str, list[RuntimeError]] = field(default_factory=dict)
     fetch_calls: list[str] = field(default_factory=list)
+    widget_keys: tuple[str, ...] = ("teamInfo",)
 
     async def fetch_fixture_stats(
         self,
@@ -805,7 +806,14 @@ async def test_fetch_fixture_details_retries_transient_sportybet_failures() -> N
         page_title="Arsenal vs Chelsea",
         fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
         widget_loader_status="loaded",
-        widgets=(),
+        widgets=(
+            SportyBetFixtureStatsWidget(
+                widget_key="teamInfo",
+                widget_type="team.info",
+                status="mounted",
+                content_lines=("Home manager: Mikel Arteta",),
+            ),
+        ),
         responses=(),
     )
     scraper = StubSportyBetFixtureStatsScraper(

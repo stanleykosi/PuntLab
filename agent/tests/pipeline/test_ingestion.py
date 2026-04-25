@@ -23,6 +23,7 @@ from src.providers.orchestrator import (
     OddsFetchResult,
     StatsFetchResult,
 )
+from src.schemas.fixture_details import FixtureDetails, FixtureDetailSection
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.news import NewsArticle
 from src.schemas.odds import NormalizedOdds
@@ -55,6 +56,27 @@ def build_state() -> PipelineState:
         run_date=date(2026, 4, 4),
         started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
         errors=["Existing upstream notice."],
+    )
+
+
+def build_fixture_details(fixture: NormalizedFixture) -> FixtureDetails:
+    """Create minimal SportyBet fixture details for ingestion tests."""
+
+    return FixtureDetails(
+        fixture_ref=fixture.get_fixture_ref(),
+        fixture_url="https://www.sportybet.com/ng/sport/football/england/premier-league/Arsenal_vs_Chelsea/sr:match:7001",
+        event_id=fixture.sportradar_id or "sr:match:7001",
+        match_id="7001",
+        fetched_at=datetime(2026, 4, 4, 7, 4, tzinfo=UTC),
+        widget_loader_status="loaded",
+        sections=(
+            FixtureDetailSection(
+                widget_key="teamInfo",
+                widget_type="team.info",
+                status="mounted",
+                content_lines=("Home manager: Mikel Arteta",),
+            ),
+        ),
     )
 
 
@@ -236,7 +258,7 @@ async def test_ingestion_node_preserves_full_odds_catalog_and_merges_news() -> N
                 providers_attempted=("api-football",),
             ),
             fixture_details_result=FixtureDetailsFetchResult(
-                fixture_details=(),
+                fixture_details=(build_fixture_details(fixture),),
                 providers_attempted=("sportybet_fixture_stats",),
             ),
             injuries_result=InjuryFetchResult(
@@ -324,3 +346,58 @@ async def test_ingestion_node_records_empty_fixture_and_provider_warnings() -> N
         "API-Football injury fetch failed for england_premier_league: timeout",
         "Odds coverage is incomplete for fixtures: sr:match:missing-1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_ingestion_node_fails_fast_when_sportybet_fixture_details_are_incomplete() -> None:
+    """LLM research must not run without complete SportyBet fixture-page context."""
+
+    fixture = build_fixture()
+    catalog = build_odds_market_catalog(
+        (
+            NormalizedOdds(
+                fixture_ref=fixture.get_fixture_ref(),
+                market=MarketType.MATCH_RESULT,
+                selection="home",
+                odds=1.92,
+                provider="sportybet",
+                provider_market_name="Match Winner",
+                provider_selection_name="Arsenal",
+                raw_metadata={"sportybet_fetch_source": "api"},
+            ),
+        ),
+        sport_by_fixture={fixture.get_fixture_ref(): fixture.sport},
+    )
+
+    with pytest.raises(RuntimeError, match="SportyBet fixture-page context is required"):
+        await ingestion_node(
+            build_state(),
+            orchestrator=StubProviderOrchestrator(
+                fixtures=(fixture,),
+                odds_result=OddsFetchResult(
+                    catalog=catalog,
+                    matched_rows=catalog.all_rows(),
+                    unmatched_fixture_refs=(),
+                    providers_attempted=("sportybet_api",),
+                ),
+                stats_result=StatsFetchResult(
+                    team_stats=(),
+                    player_stats=(),
+                    providers_attempted=("sportybet_fixture_stats",),
+                    warnings=("SportyBet stats fetch failed for sr:match:7001: timeout",),
+                ),
+                fixture_details_result=FixtureDetailsFetchResult(
+                    fixture_details=(),
+                    providers_attempted=("sportybet_fixture_stats",),
+                    warnings=(
+                        "SportyBet fixture details fetch failed for sr:match:7001: timeout",
+                    ),
+                ),
+                injuries_result=InjuryFetchResult(
+                    injuries=(),
+                    supporting_articles=(),
+                    providers_attempted=("api-football",),
+                ),
+                news_articles=(),
+            ),
+        )

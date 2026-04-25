@@ -3,8 +3,8 @@
 Purpose: generate fixture-level qualitative context using the canonical
 research prompt, structured `MatchContext` output, and optional Tavily search
 enrichment on top of ingestion-stage news.
-Scope: batch-oriented fixture research, evidence selection, conservative
-fallback contexts, and diagnostic propagation for LLM or search failures.
+Scope: batch-oriented fixture research, evidence selection, fail-fast LLM
+analysis, and diagnostic propagation for search failures.
 Dependencies: `src.llm` for provider/prompt access, `src.providers` for
 optional Tavily enrichment, and `src.pipeline.state.PipelineState` for
 validated state exchange between LangGraph nodes.
@@ -23,26 +23,24 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from src.cache.client import RedisClient
 from src.config import WAT_TIMEZONE, get_settings
-from src.llm import AllProvidersFailedError, MatchContext, get_llm, get_prompt
+from src.llm import MatchContext, get_llm, get_prompt
+from src.pipeline.llm_json import invoke_json_schema
 from src.pipeline.state import PipelineStage, PipelineState
 from src.providers.base import ProviderError, RateLimitedClient
-from src.providers.odds_mapping import build_fixture_market_snapshots
 from src.providers.tavily_search import TavilySearchProvider
 from src.schemas.fixture_details import FixtureDetails
 from src.schemas.fixtures import NormalizedFixture
-from src.schemas.market_snapshot import FixtureMarketSelection, FixtureMarketSnapshot
 from src.schemas.news import NewsArticle
 from src.schemas.stats import InjuryData
 
-DEFAULT_RESEARCH_BATCH_SIZE = 4
+DEFAULT_RESEARCH_BATCH_SIZE = 1
 MAX_CONTEXT_ARTICLES = 6
 MAX_TAVILY_RESULTS = 3
 MAX_ARTICLE_AGE_DAYS = 7
 MAX_FIXTURE_DETAIL_SECTION_LINES = 32
 MAX_FIXTURE_DETAIL_TOTAL_LINES = 180
 MIN_RELEVANCE_THRESHOLD = 0.20
-NEUTRAL_CONTEXT_SCORE = 0.5
-FALLBACK_SOURCE_LABEL = "PuntLab fallback"
+LOCAL_SOURCE_LABEL = "PuntLab local evidence"
 _RESEARCH_LLM_FAILURE_PATTERN = re.compile(
     r"^Research LLM analysis failed for (?P<fixture>.+?): (?P<reason>.+)$"
 )
@@ -109,31 +107,19 @@ async def research_node(
     validated_state = (
         state if isinstance(state, PipelineState) else PipelineState.model_validate(state)
     )
-    diagnostics: list[str] = []
-
     resolved_llm = llm
     if resolved_llm is None:
-        try:
-            resolved_llm = await get_llm("research")
-        except AllProvidersFailedError as exc:
-            diagnostics.append(str(exc))
-            resolved_llm = None
+        resolved_llm = await get_llm("research")
 
     owned_cleanup: Callable[[], Awaitable[None]] | None = None
     resolved_tavily = tavily_provider
+    diagnostics: list[str] = []
     if resolved_tavily is None:
         resolved_tavily, owned_cleanup, provider_diagnostic = _build_optional_tavily_provider()
         if provider_diagnostic is not None:
             diagnostics.append(provider_diagnostic)
 
     try:
-        market_snapshots = build_fixture_market_snapshots(
-            validated_state.fixtures,
-            validated_state.odds_market_catalog,
-        )
-        market_snapshot_by_fixture = {
-            snapshot.fixture_ref: snapshot for snapshot in market_snapshots
-        }
         fixture_details_by_fixture = {
             details.fixture_ref: details for details in validated_state.fixture_details
         }
@@ -145,9 +131,6 @@ async def research_node(
                         fixture=fixture,
                         state_news=validated_state.news_articles,
                         injuries=validated_state.injuries,
-                        market_snapshot=market_snapshot_by_fixture.get(
-                            fixture.get_fixture_ref()
-                        ),
                         fixture_details=fixture_details_by_fixture.get(
                             fixture.get_fixture_ref()
                         ),
@@ -179,7 +162,6 @@ async def _research_fixture(
     fixture: NormalizedFixture,
     state_news: Sequence[NewsArticle],
     injuries: Sequence[InjuryData],
-    market_snapshot: FixtureMarketSnapshot | None,
     fixture_details: FixtureDetails | None,
     llm: BaseChatModel | None,
     tavily_provider: TavilySearchProvider | None,
@@ -190,8 +172,7 @@ async def _research_fixture(
         fixture: Canonical fixture being researched.
         state_news: Ingestion-stage news articles already collected for the run.
         injuries: Structured injury rows available for the full run.
-        llm: Optional research LLM. Missing models trigger the deterministic
-            fallback context path.
+        llm: Research LLM. Missing models are not allowed in the canonical path.
         tavily_provider: Optional Tavily provider used for fresh fixture-level
             match-news enrichment.
 
@@ -218,52 +199,36 @@ async def _research_fixture(
             evidence_articles = _deduplicate_articles((*evidence_articles, *tavily_articles))
 
     if llm is None:
-        return FixtureResearchResult(
-            context=_build_fallback_context(
-                fixture=fixture,
-                articles=evidence_articles,
-                injuries=fixture_injuries,
-            ),
-            diagnostics=tuple(diagnostics),
+        raise RuntimeError("research_node requires an LLM; deterministic fallback is disabled.")
+    if fixture_details is None:
+        raise RuntimeError(
+            f"research_node requires SportyBet fixture details for {fixture.get_fixture_ref()}."
         )
 
     prompt = get_prompt("research")
-    source_labels = _source_labels(evidence_articles, fixture_injuries)
+    rendered_fixture_details = _render_fixture_details(fixture_details)
+    source_labels = _source_labels(evidence_articles, fixture_injuries, fixture_details)
     prompt_messages = prompt.format_messages(
         run_date=fixture.kickoff.astimezone(WAT_TIMEZONE).date().isoformat(),
         fixture_summary=_build_fixture_summary(fixture),
         competition_context=_build_competition_context(fixture),
         kickoff_context=_build_kickoff_context(fixture),
         known_absences=_render_known_absences(fixture, fixture_injuries),
-        fixture_details=_render_fixture_details(fixture_details),
-        market_menu=_render_market_menu(market_snapshot),
+        fixture_details=rendered_fixture_details,
         recent_news_bullets=_render_news_bullets(evidence_articles),
         source_labels=", ".join(source_labels),
     )
 
-    try:
-        context = await _invoke_structured_match_context(
-            llm=llm,
-            prompt_messages=prompt_messages,
-        )
-    except Exception as exc:
-        diagnostics.append(
-            f"Research LLM analysis failed for {fixture.get_fixture_ref()}: {exc}"
-        )
-        context = _build_fallback_context(
-            fixture=fixture,
-            articles=evidence_articles,
-            injuries=fixture_injuries,
-        )
-    else:
-        context = context.model_copy(
-            update={
-                "fixture_ref": fixture.get_fixture_ref(),
-                "data_sources": source_labels,
-                "news_summary": context.news_summary
-                or _build_news_summary(evidence_articles, fixture_injuries),
-            }
-        )
+    context = await _invoke_structured_match_context(
+        llm=llm,
+        prompt_messages=prompt_messages,
+    )
+    context = context.model_copy(
+        update={
+            "fixture_ref": fixture.get_fixture_ref(),
+            "data_sources": source_labels,
+        }
+    )
 
     return FixtureResearchResult(context=context, diagnostics=tuple(diagnostics))
 
@@ -273,7 +238,7 @@ async def _invoke_structured_match_context(
     llm: BaseChatModel,
     prompt_messages: Sequence[Any],
 ) -> MatchContext:
-    """Invoke the research LLM with schema enforcement and a targeted retry.
+    """Invoke the research LLM with prompt-level JSON enforcement.
 
     Inputs:
         llm: Configured chat model resolved for the research task.
@@ -284,171 +249,27 @@ async def _invoke_structured_match_context(
         A validated `MatchContext` object.
 
     Raises:
-        Exception: Propagates provider or parsing errors when both the default
-            and JSON-mode structured output paths fail.
+        Exception: Propagates provider or parsing errors; no fallback is used.
     """
 
-    if _is_openrouter_model(llm):
-        return await _invoke_openrouter_structured_match_context(
-            llm=llm,
-            prompt_messages=prompt_messages,
-        )
-
-    primary_runner = llm.with_structured_output(MatchContext)
-    try:
-        raw_result = await primary_runner.ainvoke(prompt_messages)
-    except Exception as exc:
-        if not _should_retry_structured_output_with_json_mode(exc):
-            raise
-        json_mode_runner = _build_json_mode_structured_runner(llm)
-        if json_mode_runner is None:
-            raise
-        raw_result = await json_mode_runner.ainvoke(prompt_messages)
-
-    return (
-        raw_result
-        if isinstance(raw_result, MatchContext)
-        else MatchContext.model_validate(raw_result)
+    return await invoke_json_schema(
+        llm=llm,
+        prompt_messages=prompt_messages,
+        schema=MatchContext,
+        instruction=_match_context_json_instruction(),
     )
 
 
-def _build_json_mode_structured_runner(llm: BaseChatModel) -> Any | None:
-    """Attempt to build a JSON-mode structured-output runner.
+def _match_context_json_instruction() -> str:
+    """Return the JSON-only instruction used for OpenRouter research models."""
 
-    Inputs:
-        llm: Configured chat model resolved for the research task.
-
-    Outputs:
-        A structured-output runner configured for JSON mode when the provider
-        implementation supports that strategy; otherwise `None`.
-    """
-
-    try:
-        return llm.with_structured_output(MatchContext, method="json_mode")
-    except TypeError:
-        return None
-
-
-def _build_json_schema_structured_runner(llm: BaseChatModel) -> Any | None:
-    """Attempt to build a JSON-schema structured-output runner.
-
-    Inputs:
-        llm: Configured chat model resolved for the research task.
-
-    Outputs:
-        A structured-output runner configured for JSON schema mode when the
-        provider implementation supports that strategy; otherwise `None`.
-    """
-
-    try:
-        return llm.with_structured_output(MatchContext, method="json_schema")
-    except TypeError:
-        return None
-
-
-def _should_retry_structured_output_with_json_mode(error: Exception) -> bool:
-    """Return whether structured output should retry using JSON mode.
-
-    Inputs:
-        error: Exception raised by the default structured-output call path.
-
-    Outputs:
-        `True` when the error matches known tool-calling parser instability
-        signatures seen with some OpenRouter models.
-    """
-
-    message = " ".join(str(error).split()).casefold()
     return (
-        "nonetype" in message and "iterable" in message
-    ) or "tool_calls" in message
-
-
-def _should_retry_openrouter_structured_output(error: Exception) -> bool:
-    """Return whether OpenRouter structured output should fallback to JSON mode.
-
-    Inputs:
-        error: Exception raised while invoking JSON-schema structured output.
-
-    Outputs:
-        `True` when the error indicates either unsupported strict-schema mode
-        or known structured-output parser instability.
-    """
-
-    message = " ".join(str(error).split()).casefold()
-    return any(
-        token in message
-        for token in (
-            "response_format",
-            "json_schema",
-            "structured output",
-            "does not support",
-            "doesn't support",
-            "unsupported",
-            "nonetype",
-            "tool_calls",
-            "schema validation",
-        )
-    )
-
-
-def _is_openrouter_model(llm: BaseChatModel) -> bool:
-    """Return whether the resolved chat model is configured for OpenRouter."""
-
-    base_url = str(
-        getattr(llm, "openai_api_base", None) or getattr(llm, "base_url", "") or ""
-    )
-    return "openrouter.ai" in base_url.casefold()
-
-
-async def _invoke_openrouter_structured_match_context(
-    *,
-    llm: BaseChatModel,
-    prompt_messages: Sequence[Any],
-) -> MatchContext:
-    """Invoke OpenRouter using documented structured-output request modes.
-
-    Inputs:
-        llm: Configured chat model resolved for the research task.
-        prompt_messages: Prompt message sequence produced by the canonical
-            research prompt template.
-
-    Outputs:
-        A validated `MatchContext` object.
-
-    Raises:
-        Exception: Propagates provider or parsing errors when both JSON schema
-            and JSON mode structured output paths fail.
-    """
-
-    json_schema_runner = _build_json_schema_structured_runner(llm)
-    json_schema_error: Exception | None = None
-    if json_schema_runner is not None:
-        try:
-            json_schema_result = await json_schema_runner.ainvoke(prompt_messages)
-            return (
-                json_schema_result
-                if isinstance(json_schema_result, MatchContext)
-                else MatchContext.model_validate(json_schema_result)
-            )
-        except Exception as exc:
-            json_schema_error = exc
-            if not _should_retry_openrouter_structured_output(exc):
-                raise
-
-    json_mode_runner = _build_json_mode_structured_runner(llm)
-    if json_mode_runner is None:
-        if json_schema_error is not None:
-            raise json_schema_error
-        raise RuntimeError(
-            "OpenRouter structured-output runner is unavailable: "
-            "neither json_schema nor json_mode is supported by this model adapter."
-        )
-
-    json_mode_result = await json_mode_runner.ainvoke(prompt_messages)
-    return (
-        json_mode_result
-        if isinstance(json_mode_result, MatchContext)
-        else MatchContext.model_validate(json_mode_result)
+        "Return only one valid JSON object. Do not use markdown. "
+        "Required keys: fixture_detail_summary, tactical_context, statistical_context, "
+        "availability_context, market_context, supplemental_news_context, qualitative_score, "
+        "data_sources. Use null for optional context fields when the supplied widgets do "
+        "not support them. Do not include any keys outside the schema. Use a number from "
+        "0 to 1 for qualitative_score."
     )
 
 
@@ -598,11 +419,16 @@ def _deduplicate_articles(articles: Sequence[NewsArticle]) -> tuple[NewsArticle,
 def _source_labels(
     articles: Sequence[NewsArticle],
     injuries: Sequence[InjuryData],
+    fixture_details: FixtureDetails | None = None,
 ) -> tuple[str, ...]:
     """Build ordered unique source labels grounded in evidence, not model output."""
 
     labels: list[str] = []
     seen: set[str] = set()
+
+    if fixture_details is not None:
+        labels.append("SportyBet fixture-page widgets")
+        seen.add("sportybet fixture-page widgets")
 
     for article in articles:
         lookup_key = article.source.casefold()
@@ -621,7 +447,7 @@ def _source_labels(
         seen.add(lookup_key)
         labels.append(injury.source_provider)
 
-    return tuple(labels) if labels else (FALLBACK_SOURCE_LABEL,)
+    return tuple(labels) if labels else (LOCAL_SOURCE_LABEL,)
 
 
 def _render_known_absences(
@@ -674,8 +500,6 @@ def _render_fixture_details(details: FixtureDetails | None) -> str:
     for section in details.sections:
         section_lines = section.content_lines[:MAX_FIXTURE_DETAIL_SECTION_LINES]
         if not section_lines:
-            if section.status == "mounted":
-                continue
             error = section.error_message or "no readable content"
             lines.append(f"{section.widget_key}: {section.status} ({error}).")
             continue
@@ -695,53 +519,6 @@ def _render_fixture_details(details: FixtureDetails | None) -> str:
             )
 
     return "\n".join(lines)
-
-
-def _render_market_menu(snapshot: FixtureMarketSnapshot | None) -> str:
-    """Render one full fixture market menu in a compact prompt-friendly shape."""
-
-    if snapshot is None or snapshot.fetched_market_count == 0:
-        return "No SportyBet market snapshot was available for this fixture."
-
-    lines = [
-        (
-            "SportyBet market coverage: "
-            f"{snapshot.total_market_size} total markets "
-            + (
-                "(reported "
-                f"{snapshot.reported_total_market_size}, "
-                f"fetched {snapshot.fetched_market_count})"
-                if snapshot.reported_total_market_size is not None
-                else f"(fetched {snapshot.fetched_market_count})"
-            )
-            + f"; {snapshot.fetched_selection_count} active selections; "
-            f"{snapshot.scoreable_market_count} currently map into PuntLab's scoring taxonomy."
-        )
-    ]
-
-    for market_group in snapshot.market_groups:
-        lines.append(f"{market_group.group_name}:")
-        for market in market_group.markets:
-            lines.append(
-                f"- {market.market_label} [key={market.provider_market_key}]: "
-                + " | ".join(
-                    _format_market_selection_for_prompt(selection)
-                    for selection in market.selections
-                )
-            )
-
-    return "\n".join(lines)
-
-
-def _format_market_selection_for_prompt(selection: FixtureMarketSelection) -> str:
-    """Render one market selection as a compact odds token for prompt grounding."""
-
-    selection_label = selection.provider_selection_name
-    if selection.is_scoreable and selection.canonical_selection is not None:
-        selection_label += f" [{selection.canonical_selection}]"
-    if selection.line is not None and str(selection.line) not in selection_label:
-        selection_label += f" ({selection.line:g})"
-    return f"{selection_label} {selection.odds:.2f}"
 
 
 def _fixture_team_labels(fixture: NormalizedFixture) -> dict[str, str]:
@@ -807,43 +584,6 @@ def _build_kickoff_context(fixture: NormalizedFixture) -> str:
     if fixture.venue:
         return f"{kickoff_label} at {fixture.venue}"
     return kickoff_label
-
-
-def _build_news_summary(
-    articles: Sequence[NewsArticle],
-    injuries: Sequence[InjuryData],
-) -> str:
-    """Build a conservative news-summary field for fallback or incomplete LLM output."""
-
-    if articles:
-        summary = "; ".join(article.headline for article in articles[:2])
-        return _truncate(summary, 160)
-    if injuries:
-        return "Availability updates were noted, but broader fixture news remained limited."
-    return "Limited fixture-specific evidence keeps the qualitative view neutral."
-
-
-def _build_fallback_context(
-    *,
-    fixture: NormalizedFixture,
-    articles: Sequence[NewsArticle],
-    injuries: Sequence[InjuryData],
-) -> MatchContext:
-    """Return a deterministic neutral context when research cannot use the LLM."""
-
-    summary = _build_news_summary(articles, injuries)
-    return MatchContext(
-        fixture_ref=fixture.get_fixture_ref(),
-        morale_home=NEUTRAL_CONTEXT_SCORE,
-        morale_away=NEUTRAL_CONTEXT_SCORE,
-        rivalry_factor=NEUTRAL_CONTEXT_SCORE,
-        pressure_home=NEUTRAL_CONTEXT_SCORE,
-        pressure_away=NEUTRAL_CONTEXT_SCORE,
-        key_narrative=_truncate(summary, 200),
-        qualitative_score=NEUTRAL_CONTEXT_SCORE,
-        data_sources=_source_labels(articles, injuries),
-        news_summary=summary,
-    )
 
 
 def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str]) -> list[str]:

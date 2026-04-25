@@ -11,6 +11,7 @@ the default Redis connection URL and WAT-aware daily rate-limit keys.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -19,6 +20,7 @@ from uuid import UUID
 
 import redis.asyncio as redis_asyncio
 from pydantic import BaseModel
+from redis import exceptions as redis_exceptions
 
 from src.config import get_settings
 
@@ -34,6 +36,11 @@ JSONPrimitive = str | int | float | bool | None
 JSONValue = JSONPrimitive | dict[str, "JSONValue"] | list["JSONValue"]
 CacheModelT = TypeVar("CacheModelT", bound=BaseModel)
 Identifier = str | int | UUID
+logger = logging.getLogger(__name__)
+_TRANSIENT_REDIS_ERRORS = (
+    redis_exceptions.ConnectionError,
+    redis_exceptions.TimeoutError,
+)
 
 
 class SupportsRedisClient(Protocol):
@@ -172,7 +179,11 @@ class RedisClient:
         """
 
         normalized_key = self._normalize_text("key", key)
-        payload = await self._redis.get(normalized_key)
+        try:
+            payload = await self._redis.get(normalized_key)
+        except _TRANSIENT_REDIS_ERRORS as exc:
+            logger.warning("Retrying Redis GET for key '%s' after: %s", normalized_key, exc)
+            payload = await self._redis.get(normalized_key)
         if payload is None:
             return None
 
@@ -225,7 +236,11 @@ class RedisClient:
             separators=(",", ":"),
         )
 
-        result = await self._redis.set(normalized_key, serialized, ex=validated_ttl)
+        try:
+            result = await self._redis.set(normalized_key, serialized, ex=validated_ttl)
+        except _TRANSIENT_REDIS_ERRORS as exc:
+            logger.warning("Retrying Redis SET for key '%s' after: %s", normalized_key, exc)
+            result = await self._redis.set(normalized_key, serialized, ex=validated_ttl)
         return bool(result)
 
     async def increment(
@@ -261,12 +276,24 @@ class RedisClient:
             else ttl_seconds
         )
         validated_ttl = self._validate_ttl_seconds(resolved_ttl)
-        current_value = await self._redis.incr(normalized_key, amount=amount)
+        try:
+            current_value = await self._redis.incr(normalized_key, amount=amount)
+        except _TRANSIENT_REDIS_ERRORS as exc:
+            logger.warning("Retrying Redis INCR for key '%s' after: %s", normalized_key, exc)
+            current_value = await self._redis.incr(normalized_key, amount=amount)
 
         # Only the first increment for a fresh key should attach the TTL so the
         # counter window remains anchored to the start of that rate-limit day.
         if current_value == amount:
-            await self._redis.expire(normalized_key, validated_ttl)
+            try:
+                await self._redis.expire(normalized_key, validated_ttl)
+            except _TRANSIENT_REDIS_ERRORS as exc:
+                logger.warning(
+                    "Retrying Redis EXPIRE for key '%s' after: %s",
+                    normalized_key,
+                    exc,
+                )
+                await self._redis.expire(normalized_key, validated_ttl)
 
         return current_value
 
@@ -274,7 +301,11 @@ class RedisClient:
         """Return the daily API call count for one provider."""
 
         key = self.build_rate_limit_key(provider, for_date)
-        raw_value = await self._redis.get(key)
+        try:
+            raw_value = await self._redis.get(key)
+        except _TRANSIENT_REDIS_ERRORS as exc:
+            logger.warning("Retrying Redis GET for key '%s' after: %s", key, exc)
+            raw_value = await self._redis.get(key)
         if raw_value is None:
             return 0
 
@@ -302,7 +333,11 @@ class RedisClient:
     async def ping(self) -> bool:
         """Check whether the underlying Redis server is reachable."""
 
-        return await self._redis.ping()
+        try:
+            return await self._redis.ping()
+        except _TRANSIENT_REDIS_ERRORS as exc:
+            logger.warning("Retrying Redis PING after: %s", exc)
+            return await self._redis.ping()
 
     async def close(self) -> None:
         """Close the underlying async Redis client."""

@@ -1,45 +1,43 @@
-"""Tests for PuntLab's accumulator-building pipeline node.
-
-Purpose: verify that the builder stage converts resolved ranked matches into
-accumulator slips and degrades gracefully when no valid slips can be built.
-Scope: unit tests for `src.pipeline.nodes.accumulator_building`.
-Dependencies: pytest plus the canonical builder, pipeline-state, ranking, and
-resolved-market schemas.
-"""
+"""Tests for the LLM-led accumulator-building pipeline node."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
 from src.accumulators import AccumulatorBuilder
 from src.config import MarketType, SportName
+from src.pipeline.nodes import accumulator_building as accumulator_module
 from src.pipeline.nodes.accumulator_building import accumulator_building_node
 from src.pipeline.state import PipelineStage, PipelineState
-from src.schemas.accumulators import ResolutionSource, ResolvedMarket
+from src.schemas.accumulators import AccumulatorStrategy, ResolutionSource, ResolvedMarket
 from src.schemas.analysis import RankedMatch, ScoreFactorBreakdown
 
 
-def build_ranked_match(
-    *,
-    fixture_ref: str,
-    rank: int,
-    confidence: float,
-    composite_score: float,
-    sport: SportName = SportName.SOCCER,
-    competition: str = "Premier League",
-) -> RankedMatch:
-    """Build one canonical ranked match for node-level builder tests."""
+class FakeLLM:
+    """Minimal async chat model returning accumulator JSON."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    async def ainvoke(self, messages: object) -> object:
+        del messages
+        return type("FakeMessage", (), {"content": json.dumps(self.payload)})()
+
+
+def build_ranked_match(index: int) -> RankedMatch:
+    """Create one ranked match for accumulator tests."""
 
     return RankedMatch(
-        fixture_ref=fixture_ref,
-        sport=sport,
-        competition=competition,
-        home_team=f"Home {rank}",
-        away_team=f"Away {rank}",
-        composite_score=composite_score,
-        confidence=confidence,
+        fixture_ref=f"sr:match:{7100 + index}",
+        sport=SportName.SOCCER,
+        competition="Premier League",
+        home_team=f"Home {index}",
+        away_team=f"Away {index}",
+        composite_score=0.90 - (index * 0.03),
+        confidence=0.86 - (index * 0.03),
         factors=ScoreFactorBreakdown(
             form=0.78,
             h2h=0.56,
@@ -49,20 +47,17 @@ def build_ranked_match(
             venue=0.69,
             statistical=0.62,
         ),
-        recommended_market=MarketType.MATCH_RESULT,
-        recommended_selection="home",
+        recommended_market="full_time_result",
+        recommended_canonical_market=MarketType.MATCH_RESULT,
+        recommended_selection=f"Home {index}",
         recommended_odds=1.72,
-        qualitative_summary="The home side profiles clearly stronger.",
-        rank=rank,
+        qualitative_summary=f"Home {index} profiles stronger.",
+        rank=index,
     )
 
 
-def build_resolved_market(
-    *,
-    ranked_match: RankedMatch,
-    odds: float,
-) -> ResolvedMarket:
-    """Build one resolved market aligned with a ranked match recommendation."""
+def build_resolved_market(ranked_match: RankedMatch, odds: float) -> ResolvedMarket:
+    """Create one resolved market aligned with a ranked match."""
 
     return ResolvedMarket(
         fixture_ref=ranked_match.fixture_ref,
@@ -70,51 +65,63 @@ def build_resolved_market(
         competition=ranked_match.competition,
         home_team=ranked_match.home_team,
         away_team=ranked_match.away_team,
-        market=ranked_match.recommended_market or MarketType.MATCH_RESULT,
-        selection=ranked_match.recommended_selection or "home",
+        market="full_time_result",
+        canonical_market=MarketType.MATCH_RESULT,
+        selection=ranked_match.recommended_selection or ranked_match.home_team,
         odds=odds,
         provider="sportybet",
         provider_market_name="Full Time Result",
-        provider_selection_name=ranked_match.recommended_selection or "home",
-        provider_market_id="match_result",
+        provider_selection_name=ranked_match.recommended_selection or ranked_match.home_team,
+        provider_market_id=1,
         market_label="Full Time Result",
         resolution_source=ResolutionSource.SPORTYBET_API,
         resolved_at=datetime(2026, 4, 5, 8, 0, tzinfo=UTC),
     )
 
 
-def build_candidate_pool(
-    *,
-    count: int = 6,
-) -> tuple[tuple[RankedMatch, ...], tuple[ResolvedMarket, ...]]:
-    """Build enough ranked matches and resolved markets to create slips."""
+def build_candidate_pool() -> tuple[list[RankedMatch], list[ResolvedMarket]]:
+    """Build a small resolved leg pool."""
 
-    ranked_matches = tuple(
-        build_ranked_match(
-            fixture_ref=f"sr:match:{7100 + index}",
-            rank=index,
-            confidence=0.95 - (index * 0.04),
-            composite_score=0.90 - (index * 0.03),
-            competition="Premier League" if index <= 3 else "La Liga",
-        )
-        for index in range(1, count + 1)
-    )
-    resolved_markets = tuple(
-        build_resolved_market(
-            ranked_match=ranked_match,
-            odds=1.55 + (ranked_match.rank * 0.08),
-        )
-        for ranked_match in ranked_matches
-    )
-    return ranked_matches, resolved_markets
+    ranked = [build_ranked_match(index) for index in range(1, 5)]
+    resolved = [
+        build_resolved_market(ranked_match, odds=1.55 + (ranked_match.rank * 0.08))
+        for ranked_match in ranked
+    ]
+    return ranked, resolved
 
 
 @pytest.mark.asyncio
-async def test_accumulator_building_node_generates_slips_and_advances_stage() -> None:
-    """The node should build accumulator slips using the shared builder."""
+async def test_accumulator_building_node_uses_llm_slips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node should build slips from the exact LLM-selected fixture refs."""
 
     run_uuid = uuid4()
-    ranked_matches, resolved_markets = build_candidate_pool(count=8)
+    ranked_matches, resolved_markets = build_candidate_pool()
+    async def fake_get_llm(task: str) -> FakeLLM:
+        del task
+        return FakeLLM(
+            {
+                "slips": [
+                    {
+                        "slip_number": 1,
+                        "leg_fixture_refs": ["sr:match:7101", "sr:match:7102"],
+                        "confidence": 0.74,
+                        "strategy": "confident",
+                        "rationale": "Two strongest resolved legs.",
+                    },
+                    {
+                        "slip_number": 2,
+                        "leg_fixture_refs": ["sr:match:7103", "sr:match:7104"],
+                        "confidence": 0.61,
+                        "strategy": "balanced",
+                        "rationale": "A wider second angle.",
+                    },
+                ]
+            }
+        )
+
+    monkeypatch.setattr(accumulator_module, "get_llm", fake_get_llm)
 
     result = await accumulator_building_node(
         PipelineState(
@@ -122,69 +129,59 @@ async def test_accumulator_building_node_generates_slips_and_advances_stage() ->
             run_date=date(2026, 4, 5),
             started_at=datetime(2026, 4, 5, 7, 0, tzinfo=UTC),
             current_stage=PipelineStage.ACCUMULATOR_BUILDING,
-            ranked_matches=list(ranked_matches),
-            resolved_markets=list(resolved_markets),
+            ranked_matches=ranked_matches,
+            resolved_markets=resolved_markets,
             errors=["Market resolution completed."],
-        ),
-        builder=AccumulatorBuilder(target_count=3),
-    )
-
-    assert result["current_stage"] == PipelineStage.EXPLANATION
-    assert result["errors"] == ["Market resolution completed."]
-    assert len(result["accumulators"]) == 3
-    assert [slip.slip_number for slip in result["accumulators"]] == [1, 2, 3]
-    assert all(slip.slip_date == date(2026, 4, 5) for slip in result["accumulators"])
-    assert all(slip.run_id == run_uuid for slip in result["accumulators"])
-    assert [slip.confidence for slip in result["accumulators"]] == sorted(
-        (slip.confidence for slip in result["accumulators"]),
-        reverse=True,
-    )
-
-
-@pytest.mark.asyncio
-async def test_accumulator_building_node_records_builder_failures_and_returns_empty_slips() -> None:
-    """Builder failures should surface as diagnostics without crashing the stage."""
-
-    result = await accumulator_building_node(
-        PipelineState(
-            run_id="run-2026-04-05-main",
-            run_date=date(2026, 4, 5),
-            started_at=datetime(2026, 4, 5, 7, 15, tzinfo=UTC),
-            current_stage=PipelineStage.ACCUMULATOR_BUILDING,
-            ranked_matches=[],
-            resolved_markets=[],
         ),
         builder=AccumulatorBuilder(target_count=2),
     )
 
     assert result["current_stage"] == PipelineStage.EXPLANATION
-    assert result["accumulators"] == []
-    assert result["errors"] == [
-        (
-            "Accumulator building failed for run run-2026-04-05-main: "
-            "build_accumulators could not produce any unique accumulator slips."
-        )
+    assert result["errors"] == ["Market resolution completed."]
+    assert len(result["accumulators"]) == 2
+    first_slip = result["accumulators"][0]
+    assert first_slip.run_id == run_uuid
+    assert first_slip.strategy is AccumulatorStrategy.CONFIDENT
+    assert [leg.fixture_ref for leg in first_slip.legs] == [
+        "sr:match:7101",
+        "sr:match:7102",
     ]
+    assert first_slip.total_odds == pytest.approx(round(1.63 * 1.71, 3))
 
 
 @pytest.mark.asyncio
-async def test_accumulator_building_node_allows_descriptive_run_ids_without_errors() -> None:
-    """Non-UUID run IDs should still allow slip generation with `run_id=None`."""
+async def test_accumulator_building_node_rejects_unknown_llm_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accumulator LLM cannot select fixtures outside the resolved pool."""
 
     ranked_matches, resolved_markets = build_candidate_pool()
+    async def fake_get_llm(task: str) -> FakeLLM:
+        del task
+        return FakeLLM(
+            {
+                "slips": [
+                    {
+                        "slip_number": 1,
+                        "leg_fixture_refs": ["sr:match:7101", "sr:match:9999"],
+                        "confidence": 0.74,
+                        "strategy": "confident",
+                        "rationale": "Includes unknown fixture.",
+                    }
+                ]
+            }
+        )
 
-    result = await accumulator_building_node(
-        PipelineState(
-            run_id="run-2026-04-05-main",
-            run_date=date(2026, 4, 5),
-            started_at=datetime(2026, 4, 5, 7, 20, tzinfo=UTC),
-            current_stage=PipelineStage.ACCUMULATOR_BUILDING,
-            ranked_matches=list(ranked_matches),
-            resolved_markets=list(resolved_markets),
-        ),
-        builder=AccumulatorBuilder(target_count=1),
-    )
+    monkeypatch.setattr(accumulator_module, "get_llm", fake_get_llm)
 
-    assert result["errors"] == []
-    assert len(result["accumulators"]) == 1
-    assert result["accumulators"][0].run_id is None
+    with pytest.raises(ValueError, match="unknown or unresolved fixture"):
+        await accumulator_building_node(
+            PipelineState(
+                run_id="run-2026-04-05-main",
+                run_date=date(2026, 4, 5),
+                started_at=datetime(2026, 4, 5, 7, 0, tzinfo=UTC),
+                current_stage=PipelineStage.ACCUMULATOR_BUILDING,
+                ranked_matches=ranked_matches,
+                resolved_markets=resolved_markets,
+            )
+        )

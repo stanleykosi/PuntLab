@@ -592,6 +592,12 @@ class SportyBetFixtureStatsScraper:
         self._widget_keys = normalized_widget_keys
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    @property
+    def widget_keys(self) -> tuple[str, ...]:
+        """Return the configured SportyBet/Sportradar widget keys."""
+
+        return self._widget_keys
+
     async def fetch_fixture_stats(
         self,
         *,

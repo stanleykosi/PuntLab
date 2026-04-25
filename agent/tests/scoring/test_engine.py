@@ -132,25 +132,17 @@ def build_odds_row(
 def build_context(
     *,
     qualitative_score: float = 0.74,
-    morale_home: float = 0.82,
-    morale_away: float = 0.46,
-    pressure_home: float = 0.40,
-    pressure_away: float = 0.68,
-    rivalry_factor: float = 0.72,
 ) -> MatchContext:
     """Build a canonical qualitative context object for engine tests."""
 
     return MatchContext(
         fixture_ref="sr:match:61301159",
-        morale_home=morale_home,
-        morale_away=morale_away,
-        rivalry_factor=rivalry_factor,
-        pressure_home=pressure_home,
-        pressure_away=pressure_away,
-        key_narrative="The home side arrives with stronger momentum and less pressure.",
+        fixture_detail_summary="SportyBet widgets show the home side has the cleaner setup.",
+        tactical_context="Home lineup and comparison context are stronger.",
+        statistical_context="Home side carries better attacking indicators.",
+        supplemental_news_context="External articles support the home edge.",
         qualitative_score=qualitative_score,
-        data_sources=("BBC Sport", "Tavily"),
-        news_summary="Home morale is materially stronger heading into the fixture.",
+        data_sources=("SportyBet fixture-page widgets", "BBC Sport"),
     )
 
 
@@ -297,16 +289,16 @@ def test_scoring_engine_selects_home_match_result_for_strong_home_edge() -> None
         h2h_data=(),
     )
 
-    assert score.recommended_market == "full_time_result"
-    assert score.recommended_market_label == "Full Time Result"
-    assert score.recommended_canonical_market is MarketType.MATCH_RESULT
-    assert score.recommended_selection == "Arsenal"
-    assert score.recommended_odds == pytest.approx(1.64)
+    assert score.recommended_market == "goals_over_under"
+    assert score.recommended_market_label == "Goals Over/Under"
+    assert score.recommended_canonical_market is MarketType.OVER_UNDER_25
+    assert score.recommended_selection == "Over 2.5"
+    assert score.recommended_odds == pytest.approx(1.78)
     assert score.composite_score > 0.55
     assert score.confidence > 0.60
     assert (
         score.qualitative_summary
-        == "Home morale is materially stronger heading into the fixture."
+        == "SportyBet widgets show the home side has the cleaner setup."
     )
 
 
@@ -411,8 +403,8 @@ def test_scoring_engine_prefers_totals_market_when_only_totals_are_scoreable() -
     assert score.confidence > 0.45
 
 
-def test_scoring_engine_uses_context_suggested_provider_market_for_unmapped_market() -> None:
-    """Research-suggested exotic SportyBet markets should be selectable as-is."""
+def test_scoring_engine_ignores_removed_context_suggested_provider_market() -> None:
+    """The legacy engine should not read removed research-suggested market fields."""
 
     fixture = build_fixture()
     stats = (
@@ -455,32 +447,19 @@ def test_scoring_engine_uses_context_suggested_provider_market_for_unmapped_mark
             odds=2.15,
         ),
     )
-    context_payload = build_context().model_dump()
-    context_payload.update(
-        {
-            "suggested_market": "team_to_score_first",
-            "suggested_market_label": "Team To Score First",
-            "suggested_selection": "Arsenal",
-            "suggested_odds": 1.95,
-        }
-    )
-    context = MatchContext.model_validate(context_payload)
-
     engine = ScoringEngine()
     score = engine.calculate_match_score(
         fixture,
         stats,
         odds,
-        context=context,
+        context=build_context(),
         injuries=(),
         h2h_data=(),
     )
 
-    assert score.recommended_market == "team_to_score_first"
-    assert score.recommended_market_label == "Team To Score First"
-    assert score.recommended_canonical_market is None
-    assert score.recommended_selection == "Arsenal"
-    assert score.recommended_odds == pytest.approx(1.95)
+    assert score.recommended_market is None
+    assert score.recommended_market_label is None
+    assert score.recommended_selection is None
 
 
 def test_scoring_engine_handles_unscoreable_or_missing_odds_without_recommendation() -> None:

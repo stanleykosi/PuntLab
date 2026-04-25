@@ -124,15 +124,12 @@ async def test_analyze_context_temperes_high_llm_score_with_conservative_damping
     structured_runner = FakeStructuredLLM(
         result=MatchContext(
             fixture_ref=fixture.get_fixture_ref(),
-            morale_home=0.82,
-            morale_away=0.34,
-            rivalry_factor=0.75,
-            pressure_home=0.46,
-            pressure_away=0.78,
-            key_narrative="Arsenal arrive steadier while Chelsea carry heavier pressure.",
+            fixture_detail_summary="SportyBet fixture context favors Arsenal.",
+            tactical_context="Arsenal look tactically steadier.",
+            statistical_context="Arsenal comparison lines are stronger.",
+            supplemental_news_context="BBC and ESPN both support Arsenal.",
             qualitative_score=0.92,
             data_sources=("BBC Sport", "ESPN"),
-            news_summary="Home morale is stronger and the away side looks more unsettled.",
         )
     )
     llm = FakeLLM(structured_runner)
@@ -167,12 +164,12 @@ async def test_analyze_context_returns_neutral_when_no_relevant_news_exists() ->
     structured_runner = FakeStructuredLLM(
         result={
             "fixture_ref": fixture.get_fixture_ref(),
-            "morale_home": 0.5,
-            "morale_away": 0.5,
-            "rivalry_factor": 0.2,
-            "pressure_home": 0.5,
-            "pressure_away": 0.5,
-            "key_narrative": "Unused because the LLM should not be called.",
+            "fixture_detail_summary": "Unused because the LLM should not be called.",
+            "tactical_context": None,
+            "statistical_context": None,
+            "availability_context": None,
+            "market_context": None,
+            "supplemental_news_context": None,
             "qualitative_score": 0.8,
             "data_sources": ["ESPN"],
         }
@@ -203,12 +200,12 @@ async def test_analyze_context_returns_neutral_when_llm_analysis_fails() -> None
     structured_runner = FakeStructuredLLM(
         result={
             "fixture_ref": fixture.get_fixture_ref(),
-            "morale_home": 0.7,
-            "morale_away": 0.4,
-            "rivalry_factor": 0.6,
-            "pressure_home": 0.4,
-            "pressure_away": 0.7,
-            "key_narrative": "Unused fallback payload.",
+            "fixture_detail_summary": "Unused fallback payload.",
+            "tactical_context": None,
+            "statistical_context": None,
+            "availability_context": None,
+            "market_context": None,
+            "supplemental_news_context": None,
             "qualitative_score": 0.75,
             "data_sources": ["Sky Sports"],
         }

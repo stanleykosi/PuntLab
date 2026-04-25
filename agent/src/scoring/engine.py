@@ -592,7 +592,10 @@ class ScoringEngine:
                     representative_row.provider_market_key
                     or representative_row.market.value
                 ),
-                market_label=representative_row.market_label or representative_row.provider_market_name,
+                market_label=(
+                    representative_row.market_label
+                    or representative_row.provider_market_name
+                ),
                 canonical_market=representative_row.market,
                 selection=representative_row.provider_selection_name,
                 canonical_selection=representative_row.selection,
@@ -646,74 +649,10 @@ class ScoringEngine:
         insights: _FixtureInsights,
         composite_score: float,
     ) -> _CandidateRecommendation | None:
-        """Build a recommendation from the research model's exact market suggestion."""
+        """Return no research-suggested candidate in the LLM-only current path."""
 
-        if (
-            context is None
-            or context.suggested_market is None
-            or context.suggested_selection is None
-        ):
-            return None
-
-        normalized_market_key = self._normalize_key(context.suggested_market)
-        normalized_selection_key = self._normalize_key(context.suggested_selection)
-        matching_rows = tuple(
-            row
-            for row in relevant_odds
-            if (
-                (row.provider_market_key or self._normalize_key(row.provider_market_name))
-                == normalized_market_key
-            )
-            and (
-                row.provider_selection_key == normalized_selection_key
-                or self._normalize_key(row.selection) == normalized_selection_key
-            )
-            and (
-                context.suggested_line is None
-                or row.line is None
-                or isclose(row.line, context.suggested_line, abs_tol=0.001)
-            )
-        )
-        if not matching_rows:
-            return None
-
-        representative_row = min(
-            matching_rows,
-            key=lambda row: (
-                abs(row.odds - context.suggested_odds)
-                if context.suggested_odds is not None
-                else 0.0,
-                -row.odds,
-            ),
-        )
-        canonical_market = representative_row.market
-        fit_score = (
-            self._score_market_fit(
-                market=canonical_market,
-                selection=representative_row.selection,
-                line=representative_row.line,
-                insights=insights,
-            )
-            if canonical_market is not None
-            else _clamp((composite_score * 0.60) + ((context.qualitative_score) * 0.40))
-        )
-
-        return _CandidateRecommendation(
-            market_key=representative_row.provider_market_key or normalized_market_key,
-            market_label=representative_row.market_label or representative_row.provider_market_name,
-            canonical_market=canonical_market,
-            selection=representative_row.provider_selection_name,
-            canonical_selection=(
-                representative_row.selection if canonical_market is not None else None
-            ),
-            line=representative_row.line,
-            rows=matching_rows,
-            representative_row=representative_row,
-            recommended_odds=representative_row.odds,
-            fit_score=fit_score,
-            agreement_score=self._calculate_candidate_agreement(matching_rows),
-            provider_count=len({row.provider.casefold() for row in matching_rows}),
-        )
+        del relevant_odds, context, insights, composite_score
+        return None
 
     def _build_fixture_insights(
         self,
@@ -1081,9 +1020,7 @@ class ScoringEngine:
         total = expected_home + expected_away
 
         if context is not None:
-            intensity_adjustment = (context.rivalry_factor * 0.08) - (
-                ((context.pressure_home + context.pressure_away) / 2.0) * 0.04
-            )
+            intensity_adjustment = (context.qualitative_score - 0.5) * 0.08
             if sport == SportName.BASKETBALL:
                 total += intensity_adjustment * 12.0
             else:
@@ -1117,7 +1054,6 @@ class ScoringEngine:
         if context is not None:
             scoring_pressure = _clamp(
                 scoring_pressure
-                + (context.rivalry_factor * 0.05)
                 + ((context.qualitative_score - 0.5) * 0.08)
             )
         return scoring_pressure
@@ -1141,10 +1077,7 @@ class ScoringEngine:
 
         if context is None:
             return 0.0
-        return _clamp_signed(
-            ((context.morale_home - context.morale_away) * 0.65)
-            + ((context.pressure_away - context.pressure_home) * 0.35)
-        )
+        return 0.0
 
     def _injury_side_edge(
         self,
@@ -1206,7 +1139,7 @@ class ScoringEngine:
 
         if context is None:
             return None
-        return context.news_summary or context.key_narrative
+        return context.fixture_detail_summary
 
     @staticmethod
     def _normalize_key(value: str) -> str:

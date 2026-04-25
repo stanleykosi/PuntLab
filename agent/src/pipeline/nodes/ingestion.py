@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from src.config import SUPPORTED_COMPETITIONS, SportName
 from src.pipeline.state import PipelineStage, PipelineState
 from src.providers.odds_mapping import OddsMarketCatalog
 from src.providers.orchestrator import (
@@ -104,6 +105,11 @@ async def ingestion_node(
 
     fixtures = await stage_orchestrator.fetch_fixtures(
         run_date=validated_state.run_date,
+        competitions=tuple(
+            competition
+            for competition in SUPPORTED_COMPETITIONS
+            if competition.include_in_daily_analysis
+        ),
     )
     odds_result = await stage_orchestrator.fetch_odds(fixtures=fixtures)
     fixture_details_result = await stage_orchestrator.fetch_fixture_details(
@@ -127,6 +133,12 @@ async def ingestion_node(
         injuries_result=injuries_result,
         fixture_count=len(fixtures),
         run_date=validated_state.run_date.isoformat(),
+    )
+    _require_complete_sportybet_fixture_context(
+        fixtures=fixtures,
+        fixture_details_result=fixture_details_result,
+        stats_result=stats_result,
+        diagnostics=diagnostics,
     )
 
     return {
@@ -196,6 +208,68 @@ def _build_ingestion_diagnostics(
     # The node surfaces provider warnings as explicit diagnostics because later
     # stages need operator-visible context when the slate is only partially supported.
     return tuple(diagnostics)
+
+
+def _require_complete_sportybet_fixture_context(
+    *,
+    fixtures: Sequence[object],
+    fixture_details_result: FixtureDetailsFetchResult,
+    stats_result: StatsFetchResult,
+    diagnostics: Sequence[str],
+) -> None:
+    """Fail ingestion when SportyBet fixture-page context is incomplete."""
+
+    soccer_fixture_refs = {
+        fixture.get_fixture_ref()
+        for fixture in fixtures
+        if getattr(fixture, "sport", None) == SportName.SOCCER
+    }
+    if not soccer_fixture_refs:
+        return
+
+    detail_refs = {
+        detail.fixture_ref
+        for detail in fixture_details_result.fixture_details
+        if detail.fixture_ref in soccer_fixture_refs
+    }
+    missing_detail_refs = sorted(soccer_fixture_refs - detail_refs)
+    low_signal_detail_refs = sorted(
+        detail.fixture_ref
+        for detail in fixture_details_result.fixture_details
+        if detail.fixture_ref in soccer_fixture_refs
+        and not any(section.content_lines for section in detail.sections)
+    )
+    sportybet_failures = tuple(
+        message
+        for message in diagnostics
+        if message.startswith(
+            (
+                "SportyBet fixture details limited",
+                "SportyBet fixture details fetch failed",
+                "SportyBet fixture details skipped",
+                "SportyBet stats limited",
+                "SportyBet stats fetch failed",
+                "SportyBet stats skipped",
+                "SportyBet stats fetch returned no scoreable",
+            )
+        )
+    )
+    if not missing_detail_refs and not low_signal_detail_refs and not sportybet_failures:
+        return
+
+    details: list[str] = []
+    if missing_detail_refs:
+        details.append(f"missing fixture details for: {', '.join(missing_detail_refs)}")
+    if low_signal_detail_refs:
+        details.append(
+            "fixture details contained no readable SportyBet widget lines for: "
+            + ", ".join(low_signal_detail_refs)
+        )
+    details.extend(sportybet_failures)
+    raise RuntimeError(
+        "SportyBet fixture-page context is required for LLM research; "
+        + " | ".join(details)
+    )
 
 
 __all__ = ["ingestion_node"]

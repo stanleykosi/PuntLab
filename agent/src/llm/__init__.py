@@ -9,7 +9,6 @@ Dependencies: `src.llm.providers` for runtime model construction.
 
 from src.llm.prompts import (
     ACCUMULATOR_RATIONALE_PROMPT,
-    LEG_RATIONALE_PROMPT,
     NEWS_CONTEXT_ANALYSIS_PROMPT,
     PROMPT_REGISTRY,
     PROMPT_TASK_KEYS,
@@ -27,7 +26,6 @@ from src.llm.providers import (
 )
 from src.llm.schemas import (
     AccumulatorRationale,
-    LegRationale,
     MatchContext,
     QualitativeScore,
 )
@@ -36,8 +34,6 @@ __all__ = [
     "ACCUMULATOR_RATIONALE_PROMPT",
     "AccumulatorRationale",
     "AllProvidersFailedError",
-    "LEG_RATIONALE_PROMPT",
-    "LegRationale",
     "LLMTaskConfig",
     "MatchContext",
     "NEWS_CONTEXT_ANALYSIS_PROMPT",

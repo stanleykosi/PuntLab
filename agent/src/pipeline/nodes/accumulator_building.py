@@ -1,13 +1,4 @@
-"""Accumulator-building node for PuntLab's LangGraph pipeline.
-
-Purpose: transform resolved ranked-match opportunities into the canonical
-daily accumulator slip slate consumed by explanation and delivery stages.
-Scope: invoke the shared accumulator builder, pass through the current run
-date and optional UUID run identifier, and surface stage-level diagnostics
-when no slips can be generated from the available candidate pool.
-Dependencies: `src.accumulators.AccumulatorBuilder` for slip generation and
-`src.pipeline.state.PipelineState` for validated LangGraph state exchange.
-"""
+"""LLM accumulator-building node for PuntLab's LangGraph pipeline."""
 
 from __future__ import annotations
 
@@ -16,7 +7,12 @@ from typing import Any
 from uuid import UUID
 
 from src.accumulators import AccumulatorBuilder
+from src.llm import get_llm, get_prompt
+from src.pipeline.llm_json import invoke_json_schema
 from src.pipeline.state import PipelineStage, PipelineState
+from src.schemas.accumulators import AccumulatorLeg, AccumulatorSlip, ResolvedMarket
+from src.schemas.analysis import RankedMatch
+from src.schemas.llm_decisions import LLMAccumulatorPortfolio
 
 
 async def accumulator_building_node(
@@ -40,28 +36,44 @@ async def accumulator_building_node(
     validated_state = (
         state if isinstance(state, PipelineState) else PipelineState.model_validate(state)
     )
-    stage_builder = builder or AccumulatorBuilder()
-    diagnostics: list[str] = []
+    if not validated_state.ranked_matches or not validated_state.resolved_markets:
+        raise RuntimeError("accumulator_building_node requires ranked and resolved LLM outputs.")
 
-    try:
-        accumulators = list(
-            stage_builder.build_accumulators(
+    target_count = (
+        builder.target_count if builder is not None else AccumulatorBuilder().target_count
+    )
+    llm = await get_llm("accumulator_builder")
+    prompt = get_prompt("accumulator_builder")
+    portfolio = await invoke_json_schema(
+        llm=llm,
+        prompt_messages=prompt.format_messages(
+            run_date=validated_state.run_date.isoformat(),
+            target_count=target_count,
+            resolved_leg_menu=_render_resolved_leg_menu(
                 validated_state.ranked_matches,
                 validated_state.resolved_markets,
-                slip_date=validated_state.run_date,
-                run_id=_coerce_run_uuid(validated_state.run_id),
-            )
-        )
-    except (TypeError, ValueError) as exc:
-        diagnostics.append(
-            f"Accumulator building failed for run {validated_state.run_id}: {exc}"
-        )
-        accumulators = []
+            ),
+        ),
+        schema=LLMAccumulatorPortfolio,
+        instruction=(
+            "Return only this JSON shape: {\"slips\":[{\"slip_number\":1,"
+            "\"leg_fixture_refs\":[\"fixture-ref-a\",\"fixture-ref-b\"],"
+            "\"confidence\":0.72,\"strategy\":\"balanced\",\"rationale\":\"short reason\"}]}. "
+            "Use only supplied fixture refs."
+        ),
+    )
+    accumulators = _build_accumulators_from_llm(
+        portfolio=portfolio,
+        ranked_matches=validated_state.ranked_matches,
+        resolved_markets=validated_state.resolved_markets,
+        slip_date=validated_state.run_date,
+        run_id=_coerce_run_uuid(validated_state.run_id),
+    )
 
     return {
         "current_stage": PipelineStage.EXPLANATION,
         "accumulators": accumulators,
-        "errors": _merge_diagnostics(validated_state.errors, diagnostics),
+        "errors": list(validated_state.errors),
     }
 
 
@@ -82,20 +94,88 @@ def _coerce_run_uuid(run_id: str) -> UUID | None:
         return None
 
 
-def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str]) -> list[str]:
-    """Append new diagnostics to the pipeline error list without duplicates."""
+def _render_resolved_leg_menu(
+    ranked_matches: Sequence[RankedMatch],
+    resolved_markets: Sequence[ResolvedMarket],
+) -> str:
+    """Render resolved legs for the accumulator-builder prompt."""
 
-    merged_errors = list(existing_errors)
-    seen_messages = {message.casefold() for message in merged_errors}
-
-    for diagnostic in diagnostics:
-        lookup_key = diagnostic.casefold()
-        if lookup_key in seen_messages:
+    ranked_by_ref = {match.fixture_ref: match for match in ranked_matches}
+    lines: list[str] = []
+    for market in resolved_markets:
+        ranked = ranked_by_ref.get(market.fixture_ref)
+        if ranked is None:
             continue
-        seen_messages.add(lookup_key)
-        merged_errors.append(diagnostic)
+        lines.append(
+            f"- fixture_ref={market.fixture_ref}; rank={ranked.rank}; "
+            f"{market.home_team} vs {market.away_team}; league={market.competition}; "
+            f"market={market.market_label or market.provider_market_name} [key={market.market}]; "
+            f"selection={market.provider_selection_name}; odds={market.odds:.2f}; "
+            f"line={market.line}; confidence={ranked.confidence:.2f}; "
+            f"score={ranked.composite_score:.2f}"
+        )
+    return "\n".join(lines)
 
-    return merged_errors
+
+def _build_accumulators_from_llm(
+    *,
+    portfolio: LLMAccumulatorPortfolio,
+    ranked_matches: Sequence[RankedMatch],
+    resolved_markets: Sequence[ResolvedMarket],
+    slip_date: object,
+    run_id: UUID | None,
+) -> list[AccumulatorSlip]:
+    """Translate LLM-selected fixture combinations into validated slips."""
+
+    ranked_by_ref = {match.fixture_ref: match for match in ranked_matches}
+    market_by_ref = {market.fixture_ref: market for market in resolved_markets}
+    accumulators: list[AccumulatorSlip] = []
+    for slip_choice in portfolio.slips:
+        legs: list[AccumulatorLeg] = []
+        for leg_number, fixture_ref in enumerate(slip_choice.leg_fixture_refs, start=1):
+            ranked = ranked_by_ref.get(fixture_ref)
+            market = market_by_ref.get(fixture_ref)
+            if ranked is None or market is None:
+                raise ValueError(
+                    f"LLM accumulator selected unknown or unresolved fixture {fixture_ref!r}."
+                )
+            legs.append(
+                AccumulatorLeg(
+                    leg_number=leg_number,
+                    fixture_ref=fixture_ref,
+                    sport=ranked.sport,
+                    competition=ranked.competition,
+                    home_team=ranked.home_team,
+                    away_team=ranked.away_team,
+                    market=market.market,
+                    canonical_market=market.canonical_market,
+                    selection=market.provider_selection_name,
+                    odds=market.odds,
+                    provider=market.provider,
+                    confidence=ranked.confidence,
+                    resolution_source=market.resolution_source,
+                    market_label=market.market_label,
+                    line=market.line,
+                    rationale=ranked.qualitative_summary or slip_choice.rationale,
+                    sportybet_url=market.sportybet_url,
+                )
+            )
+        total_odds = 1.0
+        for leg in legs:
+            total_odds *= leg.odds
+        accumulators.append(
+            AccumulatorSlip(
+                run_id=run_id,
+                slip_date=slip_date,
+                slip_number=slip_choice.slip_number,
+                legs=tuple(legs),
+                total_odds=round(total_odds, 3),
+                leg_count=len(legs),
+                confidence=slip_choice.confidence,
+                strategy=slip_choice.strategy,
+            )
+        )
+    return accumulators
 
 
 __all__ = ["accumulator_building_node"]

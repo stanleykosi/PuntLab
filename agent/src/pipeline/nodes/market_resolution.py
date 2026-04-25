@@ -1,39 +1,19 @@
-"""Market-resolution node for PuntLab's LangGraph pipeline.
-
-Purpose: resolve ranked match recommendations into sportsbook-ready markets
-using the canonical SportyBet resolver fallback chain before accumulator
-building.
-Scope: fixture lookup, deterministic resolver orchestration, prefetched
-SportyBet catalog support, and recoverable diagnostics for per-fixture
-resolution failures that should not block the rest of the slate.
-Dependencies: `src.scrapers.resolver.MarketResolver` for source fallback,
-`src.pipeline.state.PipelineState` for validated state IO, and the shared
-fixture, ranking, and resolved-market schemas.
-"""
+"""LLM market-resolution node for PuntLab's LangGraph pipeline."""
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from src.llm import get_llm, get_prompt
+from src.pipeline.llm_json import invoke_json_schema
 from src.pipeline.state import PipelineStage, PipelineState
-from src.providers.base import ProviderError
-from src.schemas.accumulators import ResolvedMarket
+from src.schemas.accumulators import ResolutionSource, ResolvedMarket
 from src.schemas.analysis import RankedMatch
 from src.schemas.fixtures import NormalizedFixture
+from src.schemas.llm_decisions import LLMResolvedMarketChoice
+from src.schemas.odds import NormalizedOdds
 from src.scrapers.resolver import MarketResolver
-
-_RESOLUTION_FAILURE_PATTERN = re.compile(
-    r"^Market resolution failed for (?P<fixture>.+?): (?P<reason>.+)$"
-)
-_RESOLUTION_SKIPPED_PATTERN = re.compile(
-    r"^Market resolution skipped for (?P<fixture>.+?): (?P<reason>.+)$"
-)
-_FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
-    flags=re.IGNORECASE,
-)
 
 
 async def market_resolution_node(
@@ -59,53 +39,60 @@ async def market_resolution_node(
     )
     fixture_index = _index_fixtures(validated_state.fixtures)
     prefetched_rows = validated_state.odds_market_catalog.all_rows()
-    diagnostics: list[str] = []
     resolved_markets: list[ResolvedMarket] = []
 
-    stage_resolver = resolver or MarketResolver()
-    try:
-        for ranked_match in _normalize_ranked_matches(validated_state.ranked_matches):
-            fixture = fixture_index.get(ranked_match.fixture_ref)
-            if fixture is None:
-                diagnostics.append(
-                    "Market resolution skipped for "
-                    f"{ranked_match.fixture_ref}: no matching fixture exists in pipeline state."
-                )
-                continue
-            if (
-                ranked_match.recommended_market is None
-                or ranked_match.recommended_selection is None
-            ):
-                diagnostics.append(
-                    "Market resolution skipped for "
-                    f"{ranked_match.fixture_ref}: ranked match lacks a recommended market "
-                    "and selection."
-                )
-                continue
+    if resolver is not None:
+        await resolver.aclose()
+        raise RuntimeError("market_resolution_node is LLM-led; resolver fallback is disabled.")
 
-            try:
-                resolved_markets.append(
-                    await stage_resolver.resolve(
-                        fixture,
-                        ranked_match,
-                        prefetched_rows=prefetched_rows,
-                    )
-                )
-            except (ProviderError, ValueError) as exc:
-                diagnostics.append(
-                    "Market resolution failed for "
-                    f"{ranked_match.fixture_ref}: {_format_resolution_error(exc)}"
-                )
-    finally:
-        await stage_resolver.aclose()
+    llm = await get_llm("market_resolution")
+    prompt = get_prompt("market_resolution")
+    for ranked_match in _normalize_ranked_matches(validated_state.ranked_matches):
+        fixture = fixture_index.get(ranked_match.fixture_ref)
+        if fixture is None:
+            raise RuntimeError(
+                f"Market resolution requires fixture {ranked_match.fixture_ref} in state."
+            )
+        fixture_rows = tuple(
+            row for row in prefetched_rows if row.fixture_ref == ranked_match.fixture_ref
+        )
+        if not fixture_rows:
+            raise RuntimeError(
+                f"Market resolution requires SportyBet odds rows for {ranked_match.fixture_ref}."
+            )
+        fixture_rows = _candidate_rows_for_resolution(ranked_match, fixture_rows)
+        row_by_id = {
+            _row_id(index): row for index, row in enumerate(fixture_rows, start=1)
+        }
+        decision = await invoke_json_schema(
+            llm=llm,
+            prompt_messages=prompt.format_messages(
+                ranked_match_summary=_render_ranked_match_summary(ranked_match),
+                row_menu=_render_row_menu(row_by_id),
+            ),
+            schema=LLMResolvedMarketChoice,
+            instruction=(
+                "Return JSON with fixture_ref, row_id, confidence, and rationale. "
+                "The row_id must be copied exactly from the supplied row menu."
+            ),
+        )
+        if decision.fixture_ref != ranked_match.fixture_ref:
+            raise ValueError(
+                "LLM market resolution returned fixture_ref "
+                f"{decision.fixture_ref!r}; expected {ranked_match.fixture_ref!r}."
+            )
+        selected_row = row_by_id.get(decision.row_id)
+        if selected_row is None:
+            raise ValueError(
+                f"LLM market resolution selected unknown row_id {decision.row_id!r} "
+                f"for {ranked_match.fixture_ref}."
+            )
+        resolved_markets.append(_build_resolved_market(selected_row, fixture))
 
     return {
         "current_stage": PipelineStage.ACCUMULATOR_BUILDING,
         "resolved_markets": resolved_markets,
-        "errors": _merge_diagnostics(
-            validated_state.errors,
-            _summarize_resolution_diagnostics(diagnostics),
-        ),
+        "errors": list(validated_state.errors),
     }
 
 
@@ -153,143 +140,96 @@ def _normalize_ranked_matches(ranked_matches: Sequence[RankedMatch]) -> tuple[Ra
     return tuple(normalized_matches)
 
 
-def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str]) -> list[str]:
-    """Append new diagnostics to the pipeline error list without duplicates."""
+def _row_id(index: int) -> str:
+    """Return a stable prompt row id."""
 
-    merged_errors = list(existing_errors)
-    seen_messages = {message.casefold() for message in merged_errors}
-
-    for diagnostic in diagnostics:
-        lookup_key = diagnostic.casefold()
-        if lookup_key in seen_messages:
-            continue
-        seen_messages.add(lookup_key)
-        merged_errors.append(diagnostic)
-
-    return merged_errors
+    return f"row_{index}"
 
 
-def _format_resolution_error(error: ProviderError | ValueError) -> str:
-    """Render one resolution error into an operator-friendly diagnostic string."""
+def _candidate_rows_for_resolution(
+    ranked_match: RankedMatch,
+    fixture_rows: Sequence[NormalizedOdds],
+) -> tuple[NormalizedOdds, ...]:
+    """Return the compact row set the LLM should resolve from."""
 
-    if isinstance(error, ProviderError):
-        detail = str(error)
-        if error.provider == "market-resolver":
-            return _normalize_market_resolver_detail(detail)
-        return f"[{error.provider}] {detail}"
-    return str(error)
-
-
-def _normalize_market_resolver_detail(detail: str) -> str:
-    """Collapse verbose resolver diagnostics to stable operator-facing causes.
-
-    Inputs:
-        detail: Raw `ProviderError` text emitted by `MarketResolver`.
-
-    Outputs:
-        A concise root-cause message with fixture-specific details removed so
-        repeated resolver failures aggregate cleanly in node diagnostics.
-    """
-
-    normalized = " ".join(detail.split())
-    if (
-        "No SportyBet source produced a compatible canonical market for the fixture."
-        in normalized
-        or "No SportyBet source produced a compatible market for the fixture."
-        in normalized
-    ):
-        return (
-            "[market-resolver] no compatible SportyBet odds were found for the "
-            "recommended market and selection."
-        )
-    normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)
-    return f"[market-resolver] {normalized}"
-
-
-def _summarize_resolution_diagnostics(diagnostics: Sequence[str]) -> tuple[str, ...]:
-    """Compress repeated fixture-level market-resolution diagnostics.
-
-    Inputs:
-        diagnostics: Ordered per-fixture market-resolution diagnostics.
-
-    Outputs:
-        A tuple where repeated failures/skips with the same reason are grouped
-        into concise root-cause summaries.
-    """
-
-    summarized: list[str] = []
-    failures_by_reason: dict[str, list[str]] = {}
-    failure_reason_examples: dict[str, str] = {}
-    skips_by_reason: dict[str, list[str]] = {}
-    skip_reason_examples: dict[str, str] = {}
-
-    for diagnostic in diagnostics:
-        failure_match = _RESOLUTION_FAILURE_PATTERN.match(diagnostic)
-        if failure_match is not None:
-            raw_reason = failure_match.group("reason").strip()
-            reason = _normalize_resolution_reason(raw_reason)
-            fixture_ref = failure_match.group("fixture").strip()
-            failures_by_reason.setdefault(reason, []).append(fixture_ref)
-            failure_reason_examples.setdefault(reason, raw_reason)
-            continue
-
-        skipped_match = _RESOLUTION_SKIPPED_PATTERN.match(diagnostic)
-        if skipped_match is not None:
-            raw_reason = skipped_match.group("reason").strip()
-            reason = _normalize_resolution_reason(raw_reason)
-            fixture_ref = skipped_match.group("fixture").strip()
-            skips_by_reason.setdefault(reason, []).append(fixture_ref)
-            skip_reason_examples.setdefault(reason, raw_reason)
-            continue
-
-        summarized.append(diagnostic)
-
-    for reason, fixture_refs in failures_by_reason.items():
-        if len(fixture_refs) == 1:
-            reason_for_single = failure_reason_examples.get(reason, reason)
-            summarized.append(
-                f"Market resolution failed for {fixture_refs[0]}: {reason_for_single}"
+    market_key = (ranked_match.recommended_market or "").casefold()
+    selection_key = (ranked_match.recommended_selection or "").casefold()
+    exact_rows = tuple(
+        row
+        for row in fixture_rows
+        if (
+            market_key
+            and (
+                (row.provider_market_key or "").casefold() == market_key
+                or row.provider_market_name.casefold() == market_key
+                or (row.market_label or "").casefold() == market_key
             )
-            continue
-        normalized_reason = reason.rstrip(".")
-        sample_refs = ", ".join(fixture_refs[:3])
-        summarized.append(
-            "Market resolution failed for "
-            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
-            f"Sample fixtures: {sample_refs}."
         )
-
-    for reason, fixture_refs in skips_by_reason.items():
-        if len(fixture_refs) == 1:
-            reason_for_single = skip_reason_examples.get(reason, reason)
-            summarized.append(
-                f"Market resolution skipped for {fixture_refs[0]}: {reason_for_single}"
+    )
+    if exact_rows:
+        selection_rows = tuple(
+            row
+            for row in exact_rows
+            if selection_key
+            and (
+                row.provider_selection_name.casefold() == selection_key
+                or row.selection.casefold() == selection_key
+                or (row.provider_selection_key or "").casefold() == selection_key
             )
-            continue
-        normalized_reason = reason.rstrip(".")
-        sample_refs = ", ".join(fixture_refs[:3])
-        summarized.append(
-            "Market resolution skipped for "
-            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
-            f"Sample fixtures: {sample_refs}."
         )
+        return selection_rows or exact_rows
+    return tuple(fixture_rows[:200])
 
-    return tuple(summarized)
+
+def _render_ranked_match_summary(ranked_match: RankedMatch) -> str:
+    """Render one ranked recommendation for the market-resolution prompt."""
+
+    return (
+        f"rank={ranked_match.rank}; fixture_ref={ranked_match.fixture_ref}; "
+        f"{ranked_match.home_team} vs {ranked_match.away_team}; "
+        f"competition={ranked_match.competition}; score={ranked_match.composite_score:.2f}; "
+        f"confidence={ranked_match.confidence:.2f}; recommended_market="
+        f"{ranked_match.recommended_market_label} [key={ranked_match.recommended_market}]; "
+        f"selection={ranked_match.recommended_selection}; odds={ranked_match.recommended_odds}; "
+        f"line={ranked_match.recommended_line}; summary={ranked_match.qualitative_summary or '-'}"
+    )
 
 
-def _normalize_resolution_reason(reason: str) -> str:
-    """Normalize fixture-specific identifiers from resolution reasons.
+def _render_row_menu(row_by_id: Mapping[str, NormalizedOdds]) -> str:
+    """Render concrete SportyBet rows with exact row ids."""
 
-    Inputs:
-        reason: Raw resolution failure/skip reason.
+    lines: list[str] = []
+    for row_id, row in row_by_id.items():
+        lines.append(
+            f"- {row_id}: market={row.market_label or row.provider_market_name} "
+            f"[key={row.provider_market_key} id={row.provider_market_id}]; "
+            f"selection={row.provider_selection_name} [key={row.provider_selection_key}]; "
+            f"odds={row.odds:.2f}; line={row.line}; canonical_market="
+            f"{row.market.value if row.market is not None else None}; period={row.period}; "
+            f"group={row.raw_metadata.get('market_group_name')}"
+        )
+    return "\n".join(lines)
 
-    Outputs:
-        A stable reason string that enables root-cause aggregation.
-    """
 
-    normalized = " ".join(reason.split())
-    normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)
-    return normalized
+def _build_resolved_market(row: NormalizedOdds, fixture: NormalizedFixture) -> ResolvedMarket:
+    """Build the final resolved market from the LLM-selected SportyBet row."""
+
+    return ResolvedMarket.model_validate(
+        {
+            **row.model_dump(),
+            "market": row.provider_market_key or row.provider_market_name,
+            "canonical_market": row.market,
+            "resolution_source": ResolutionSource.SPORTYBET_API,
+            "sport": fixture.sport,
+            "competition": fixture.competition,
+            "home_team": fixture.home_team,
+            "away_team": fixture.away_team,
+            "sportybet_market_id": row.provider_market_id
+            if isinstance(row.provider_market_id, int)
+            else None,
+            "sportybet_url": getattr(fixture, "sportybet_url", None),
+        }
+    )
 
 
 __all__ = ["market_resolution_node"]

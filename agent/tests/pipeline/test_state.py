@@ -191,14 +191,14 @@ def test_pipeline_state_serializes_all_stage_outputs() -> None:
         match_contexts=[
             MatchContext(
                 fixture_ref=fixture.get_fixture_ref(),
-                morale_home=0.81,
-                morale_away=0.58,
-                rivalry_factor=0.77,
-                pressure_home=0.69,
-                pressure_away=0.64,
-                key_narrative="Arsenal carry stronger momentum into a high-pressure derby.",
+                fixture_detail_summary=(
+                    "SportyBet widgets show Arsenal with the cleaner derby setup."
+                ),
+                tactical_context="Arsenal lineup context is stable.",
+                statistical_context="SportyBet comparison favors Arsenal.",
+                supplemental_news_context="BBC Sport adds derby context.",
                 qualitative_score=0.74,
-                data_sources=("BBC Sport", "Tavily"),
+                data_sources=("SportyBet fixture-page widgets", "BBC Sport"),
             )
         ],
         match_scores=[

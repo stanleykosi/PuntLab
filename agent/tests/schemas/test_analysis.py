@@ -24,12 +24,10 @@ def test_match_context_deduplicates_sources_and_serializes_fixture_ref() -> None
 
     context = MatchContext(
         fixture_ref="sr:match:61301159",
-        morale_home=0.8,
-        morale_away=0.52,
-        rivalry_factor=0.75,
-        pressure_home=0.61,
-        pressure_away=0.67,
-        key_narrative="Title pressure is high and both teams arrive with strong momentum.",
+        fixture_detail_summary="SportyBet widgets show a strong home setup.",
+        tactical_context="Home side projects a stable XI.",
+        statistical_context="Home side leads the comparison widget.",
+        supplemental_news_context="RSS mentions strong recent home form.",
         qualitative_score=0.72,
         data_sources=("BBC Sport", "bbc sport", "Tavily"),
     )

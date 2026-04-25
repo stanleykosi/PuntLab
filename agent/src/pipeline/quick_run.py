@@ -24,6 +24,7 @@ from datetime import UTC, date, datetime
 from time import perf_counter
 from uuid import uuid4
 
+from src.cache.client import RedisClient
 from src.config import get_settings
 from src.llm import AllProvidersFailedError, get_llm
 from src.pipeline.nodes.accumulator_building import accumulator_building_node
@@ -36,8 +37,13 @@ from src.pipeline.nodes.research import research_node
 from src.pipeline.nodes.scoring import scoring_node
 from src.pipeline.router import approval_router
 from src.pipeline.state import ApprovalStatus, PipelineStage, PipelineState
+from src.providers.orchestrator import ProviderOrchestrator
 from src.schemas.accumulators import AccumulatorSlip, AccumulatorStatus, ExplainedAccumulator
 from src.schemas.users import DeliveryChannel, DeliveryResult, DeliveryStatus
+from src.scrapers.sportybet_fixture_stats import (
+    DEFAULT_WIDGET_KEYS,
+    SportyBetFixtureStatsScraper,
+)
 
 type NodeUpdate = dict[str, object]
 type PipelineNode = Callable[[PipelineState], Awaitable[NodeUpdate]]
@@ -105,6 +111,52 @@ class QuickRunReport:
     stage_records: tuple[StageExecutionRecord, ...]
     total_duration_seconds: float
     success: bool
+
+
+class _QuickRunInMemoryRedis:
+    """Small Redis-compatible cache used by local quick-run executions."""
+
+    def __init__(self) -> None:
+        """Initialize in-memory value and expiration stores."""
+
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+
+    async def get(self, name: str) -> str | None:
+        """Return a stored string value when present."""
+
+        return self.values.get(name)
+
+    async def set(self, name: str, value: str, ex: int | None = None) -> bool:
+        """Persist a string value with an optional TTL."""
+
+        self.values[name] = value
+        if ex is not None:
+            self.expirations[name] = ex
+        return True
+
+    async def incr(self, name: str, amount: int = 1) -> int:
+        """Increment a numeric value and return the new count."""
+
+        next_value = int(self.values.get(name, "0")) + amount
+        self.values[name] = str(next_value)
+        return next_value
+
+    async def expire(self, name: str, time: int) -> bool:
+        """Attach a TTL to an existing key."""
+
+        if name not in self.values:
+            return False
+        self.expirations[name] = time
+        return True
+
+    async def ping(self) -> bool:
+        """Report the local cache as available."""
+
+        return True
+
+    async def aclose(self) -> None:
+        """Match the async Redis protocol."""
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -294,25 +346,13 @@ def _record_explanation_progress(
     event = str(payload.get("event", ""))
     if event == "stage_started":
         state["completed_slips"] = 0
-        state["completed_legs"] = 0
         return
     if event == "slip_started":
-        state["leg_index"] = 0
-        state["leg_number"] = 0
         state["slip_total_legs"] = int(payload.get("leg_count", 0))
-        return
-    if event == "leg_started":
-        leg_index = int(payload.get("leg_index", 0))
-        state["leg_index"] = max(0, leg_index - 1)
         return
     if event == "slip_completed":
         completed_slips = int(state.get("completed_slips", 0)) + 1
         state["completed_slips"] = completed_slips
-        state["leg_index"] = int(state.get("slip_total_legs", 0))
-    if event == "leg_completed":
-        completed_legs = int(state.get("completed_legs", 0)) + 1
-        state["completed_legs"] = completed_legs
-        state["leg_index"] = int(payload.get("leg_index", state.get("leg_index", 0)))
 
 
 def _render_stage_dashboard(
@@ -329,21 +369,13 @@ def _render_stage_dashboard(
 
     total_slips = int(live_state.get("total_slips", 0))
     completed_slips = int(live_state.get("completed_slips", 0))
-    total_legs = int(live_state.get("total_legs", 0))
-    completed_legs = int(live_state.get("completed_legs", 0))
-    current_slip_total_legs = int(live_state.get("slip_total_legs", 0))
-    current_slip_leg_index = int(live_state.get("leg_index", 0))
     current_slip = live_state.get("slip_number") or "?"
-    current_leg = live_state.get("leg_number") or "?"
     event = str(live_state.get("event", "starting"))
 
     slip_bar = _render_progress_bar(completed_slips, total_slips)
-    global_leg_bar = _render_progress_bar(completed_legs, total_legs)
-    current_leg_bar = _render_progress_bar(current_slip_leg_index, current_slip_total_legs)
     return (
         f"elapsed={elapsed_label} | phase={event} | slip={current_slip}/{total_slips or '?'} "
-        f"| leg={current_leg}/{current_slip_total_legs or '?'} | slips {slip_bar} "
-        f"| current-slip-legs {current_leg_bar} | all-legs {global_leg_bar}"
+        f"| slips {slip_bar}"
     )
 
 
@@ -525,8 +557,6 @@ def _render_explanation_event_line(payload: Mapping[str, object]) -> str | None:
 
     event = str(payload.get("event", "")).strip().casefold()
     slip_number = payload.get("slip_number")
-    leg_number = payload.get("leg_number")
-    fixture_ref = payload.get("fixture_ref")
     duration_seconds = payload.get("duration_seconds")
     had_error = bool(payload.get("had_error", False))
 
@@ -539,19 +569,6 @@ def _render_explanation_event_line(payload: Mapping[str, object]) -> str | None:
         return (
             f"slip #{slip_number} started "
             f"(legs={int(payload.get('leg_count', 0))})"
-        )
-    if event == "leg_started":
-        return f"leg {leg_number} started for fixture={fixture_ref}"
-    if event == "leg_completed":
-        duration_label = (
-            f"{float(duration_seconds):.2f}s"
-            if isinstance(duration_seconds, (int, float))
-            else "-"
-        )
-        status = "fallback" if had_error else "ok"
-        return (
-            f"leg {leg_number} done for fixture={fixture_ref} "
-            f"(status={status}, duration={duration_label})"
         )
     if event == "slip_rationale_started":
         return f"slip #{slip_number} accumulator rationale started"
@@ -587,18 +604,53 @@ def _build_default_pre_approval_nodes() -> tuple[StageNode, ...]:
     """Return the canonical pre-approval stage order."""
 
     return (
-        StageNode(name="ingestion", node=ingestion_node),
+        StageNode(name="ingestion", node=_quick_run_ingestion_node),
         StageNode(name="research", node=research_node, llm_tasks=("research",)),
-        StageNode(name="scoring", node=scoring_node),
-        StageNode(name="ranking", node=ranking_node),
-        StageNode(name="market_resolution", node=market_resolution_node),
-        StageNode(name="accumulator_building", node=accumulator_building_node),
+        StageNode(name="scoring", node=scoring_node, llm_tasks=("market_scoring",)),
+        StageNode(name="ranking", node=ranking_node, llm_tasks=("ranking",)),
+        StageNode(
+            name="market_resolution",
+            node=market_resolution_node,
+            llm_tasks=("market_resolution",),
+        ),
+        StageNode(
+            name="accumulator_building",
+            node=accumulator_building_node,
+            llm_tasks=("accumulator_builder",),
+        ),
         StageNode(
             name="explanation",
             node=explanation_node,
-            llm_tasks=("leg_rationale", "accumulator_rationale"),
+            llm_tasks=("accumulator_rationale",),
         ),
     )
+
+
+async def _quick_run_ingestion_node(state: PipelineState) -> NodeUpdate:
+    """Run ingestion with local cache infrastructure for CLI quick-run tests."""
+
+    cache = RedisClient(redis_client=_QuickRunInMemoryRedis())
+    fixture_stats_scraper = SportyBetFixtureStatsScraper(
+        navigation_timeout_ms=30_000,
+        post_mount_wait_ms=2_000,
+        response_timeout_ms=30_000,
+        response_body_timeout_ms=10_000,
+        settle_delay_ms=500,
+        widget_timeout_ms=8_000,
+        widget_keys=DEFAULT_WIDGET_KEYS,
+    )
+    orchestrator = ProviderOrchestrator(
+        cache=cache,
+        sportybet_fixture_stats_scraper=fixture_stats_scraper,
+        sportybet_fixture_detail_retries=1,
+        sportybet_fixture_detail_retry_backoff_seconds=1.0,
+        sportybet_fixture_detail_concurrency=2,
+        sportybet_fixture_detail_limit=None,
+    )
+    try:
+        return await ingestion_node(state, orchestrator=orchestrator)
+    finally:
+        await orchestrator.aclose()
 
 
 def _describe_llm_instance(llm_instance: object) -> tuple[str, str, str]:
@@ -764,8 +816,6 @@ async def run_quick_pipeline(
                 {
                     "total_slips": len(state.accumulators),
                     "completed_slips": 0,
-                    "total_legs": sum(len(slip.legs) for slip in state.accumulators),
-                    "completed_legs": 0,
                     "event": "queued",
                 }
             )

@@ -4,7 +4,7 @@ Purpose: provide the single current-state schema surface used with
 `with_structured_output()` across research, qualitative scoring, and
 explanation stages.
 Scope: re-export the canonical shared `MatchContext` and `QualitativeScore`
-contracts plus define explanation-specific rationale payloads.
+contracts plus define the slip-level explanation payload.
 Dependencies: `src.schemas.analysis` for the shared qualitative models and
 `src.schemas.common` for text normalization helpers.
 """
@@ -15,49 +15,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.schemas.analysis import MatchContext, QualitativeScore
 from src.schemas.common import normalize_optional_text, require_non_blank_text
-
-
-class LegRationale(BaseModel):
-    """Structured explanation output for one accumulator leg.
-
-    Inputs:
-        A prompt grounded in the selected market, fixture context, and the
-        strongest scoring signals for one leg.
-
-    Outputs:
-        A compact rationale string plus an optional concise caveat that the
-        explanation node can store directly on the leg.
-    """
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    fixture_ref: str | None = Field(
-        default=None,
-        description="Optional fixture reference echoed back for tracing.",
-    )
-    rationale: str = Field(
-        max_length=240,
-        description="Short 1-2 sentence explanation for why the leg was selected.",
-    )
-    key_risk: str | None = Field(
-        default=None,
-        max_length=140,
-        description="Optional concise caveat that materially affects confidence.",
-    )
-
-    @field_validator("fixture_ref", "key_risk")
-    @classmethod
-    def validate_optional_text(cls, value: str | None) -> str | None:
-        """Trim optional tracing and caveat fields and collapse empties to `None`."""
-
-        return normalize_optional_text(value)
-
-    @field_validator("rationale")
-    @classmethod
-    def validate_rationale(cls, value: str) -> str:
-        """Reject blank rationale text after whitespace normalization."""
-
-        return require_non_blank_text(value, "rationale")
 
 
 class AccumulatorRationale(BaseModel):
@@ -80,12 +37,12 @@ class AccumulatorRationale(BaseModel):
         description="Optional 1-based slip number echoed back for tracing.",
     )
     rationale: str = Field(
-        max_length=320,
+        max_length=1200,
         description="Compact 2-3 sentence explanation for the accumulator.",
     )
     shared_risk: str | None = Field(
         default=None,
-        max_length=160,
+        max_length=1000,
         description="Optional concise note on the slip's biggest shared risk.",
     )
 
@@ -106,7 +63,6 @@ class AccumulatorRationale(BaseModel):
 
 __all__ = [
     "AccumulatorRationale",
-    "LegRationale",
     "MatchContext",
     "QualitativeScore",
 ]

@@ -20,7 +20,10 @@ from src.llm.providers import TASK_ALIASES
 PROMPT_TASK_KEYS: Final[tuple[str, ...]] = (
     "research",
     "qualitative_assessment",
-    "leg_rationale",
+    "market_scoring",
+    "ranking",
+    "market_resolution",
+    "accumulator_builder",
     "accumulator_rationale",
 )
 
@@ -29,12 +32,12 @@ NEWS_CONTEXT_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             (
-                "You are PuntLab's fixture news analyst. Use only the supplied evidence. "
-                "Never invent injuries, quotes, lineup news, standings context, or market "
-                "options. Treat the supplied market menu as available betting inventory, not "
-                "proof of outcome likelihood. Score conservatively on a 0-1 scale when "
-                "evidence is thin. Keep key_narrative under 200 characters and news_summary "
-                "under 160 characters."
+                "You are PuntLab's SportyBet fixture-context researcher. Ground the analysis "
+                "first in the supplied SportyBet pre-match fixture-page widgets. RSS/Tavily "
+                "news is supplemental only. Never invent injuries, lineups, table position, "
+                "H2H, probability, team info, or widget data. The research stage does not "
+                "select betting markets; later stages handle market scoring and accumulator "
+                "construction."
             ),
         ),
         (
@@ -46,15 +49,12 @@ NEWS_CONTEXT_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages(
                 "Kickoff context: {kickoff_context}\n"
                 "Known absences: {known_absences}\n"
                 "SportyBet fixture-page details:\n{fixture_details}\n"
-                "Available betting markets:\n{market_menu}\n"
-                "Relevant news bullets:\n{recent_news_bullets}\n"
+                "Supplemental RSS/Tavily news bullets:\n{recent_news_bullets}\n"
                 "Source labels: {source_labels}\n\n"
-                "Assess morale, rivalry intensity, and pressure for both teams. Score "
-                "conservatively, ground every score in the supplied material, and lower "
-                "confidence if the news is weak or mixed. If one available market clearly "
-                "fits the evidence, return its exact market key, market label, selection, "
-                "odds, and line exactly as shown in the supplied market menu. Leave those "
-                "fields null when no betting angle is justified."
+                "Parse the SportyBet fixture-page details into fixture_detail_summary, "
+                "tactical_context, statistical_context, availability_context, market_context, "
+                "supplemental_news_context, qualitative_score, and data_sources. Keep all "
+                "summaries concise and grounded in the supplied widget lines."
             ),
         ),
     ]
@@ -86,24 +86,107 @@ QUALITATIVE_ASSESSMENT_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-LEG_RATIONALE_PROMPT = ChatPromptTemplate.from_messages(
+MARKET_SCORING_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             (
-                "You write betting-selection rationales for PuntLab. Keep the rationale to "
-                "1-2 sentences, under 45 words, and focus on the strongest evidence-backed "
-                "edge. Mention a caveat only if it materially changes confidence."
+                "You are PuntLab's lead betting analyst. You must choose from the exact "
+                "SportyBet markets supplied by the user, using fixture details, research, "
+                "injuries, market price, and risk. Do not invent unavailable markets. If "
+                "the evidence is weak, still choose the least-bad available market but give "
+                "lower confidence. Your output is validated as JSON, so every field must be "
+                "present and correctly typed."
             ),
         ),
         (
             "human",
             (
-                "Fixture: {fixture_summary}\n"
-                "Selection: {selection_summary}\n"
-                "Score summary: {score_summary}\n"
-                "Risk notes: {risk_notes}\n\n"
-                "Write a concise rationale a Nigerian bettor can scan quickly."
+                "Fixture:\n{fixture_summary}\n\n"
+                "Research context:\n{match_context_summary}\n\n"
+                "Raw SportyBet fixture-page details:\n{fixture_details}\n\n"
+                "Known absences:\n{known_absences}\n\n"
+                "Available SportyBet market menu:\n{market_menu}\n\n"
+                "Return a full MatchScore JSON object. Pick exactly one available market "
+                "selection from the menu. Use provider market key in recommended_market, "
+                "display label in recommended_market_label, provider selection in "
+                "recommended_selection, decimal price in recommended_odds, numeric line or "
+                "null in recommended_line, and a concise qualitative_summary explaining the "
+                "betting edge."
+            ),
+        ),
+    ]
+)
+
+RANKING_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            (
+                "You are PuntLab's slate-ranking analyst. Rank the supplied fixture "
+                "recommendations by expected betting quality, balancing model confidence, "
+                "price sanity, evidence strength, and market risk. Do not explain your "
+                "reasoning. Keep every fixture ref exactly once."
+            ),
+        ),
+        (
+            "human",
+            (
+                "Run date: {run_date}\n"
+                "Scored recommendations:\n{score_menu}\n\n"
+                "Return JSON with ranked_fixture_refs as an array of every fixture_ref, "
+                "ordered from strongest to weakest recommendation. No other keys."
+            ),
+        ),
+    ]
+)
+
+MARKET_RESOLUTION_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            (
+                "You are PuntLab's market-resolution analyst. Select exactly one concrete "
+                "SportyBet odds row from the supplied row menu. The row must match the "
+                "recommendation and be suitable for a real accumulator leg. Ambiguous labels "
+                "or missing interval details should be avoided unless they are explicitly "
+                "shown in the row."
+            ),
+        ),
+        (
+            "human",
+            (
+                "Ranked recommendation:\n{ranked_match_summary}\n\n"
+                "SportyBet rows for this fixture:\n{row_menu}\n\n"
+                "Return JSON with fixture_ref, row_id, confidence, and rationale. row_id "
+                "must be copied exactly from the menu."
+            ),
+        ),
+    ]
+)
+
+ACCUMULATOR_BUILDER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            (
+                "You are PuntLab's accumulator architect. Choose fixture-ref combinations "
+                "from the resolved SportyBet legs. Return only the requested JSON; do not "
+                "write analysis outside the JSON. Avoid duplicate fixtures inside a slip "
+                "and avoid obvious same-league correlation when alternatives exist."
+            ),
+        ),
+        (
+            "human",
+            (
+                "Run date: {run_date}\n"
+                "Target slip count: {target_count}\n"
+                "Resolved legs:\n{resolved_leg_menu}\n\n"
+                "Return a compact JSON object with key slips. Produce exactly "
+                "{target_count} slips when enough legs exist. Use 2 to 4 legs per slip. "
+                "Each slip must include slip_number, leg_fixture_refs, confidence, "
+                "strategy, and rationale. Use strategy values confident, balanced, or "
+                "aggressive. Keep each rationale under 18 words."
             ),
         ),
     ]
@@ -136,7 +219,10 @@ ACCUMULATOR_RATIONALE_PROMPT = ChatPromptTemplate.from_messages(
 PROMPT_REGISTRY: Final[dict[str, ChatPromptTemplate]] = {
     "research": NEWS_CONTEXT_ANALYSIS_PROMPT,
     "qualitative_assessment": QUALITATIVE_ASSESSMENT_PROMPT,
-    "leg_rationale": LEG_RATIONALE_PROMPT,
+    "market_scoring": MARKET_SCORING_PROMPT,
+    "ranking": RANKING_PROMPT,
+    "market_resolution": MARKET_RESOLUTION_PROMPT,
+    "accumulator_builder": ACCUMULATOR_BUILDER_PROMPT,
     "accumulator_rationale": ACCUMULATOR_RATIONALE_PROMPT,
 }
 
@@ -171,7 +257,7 @@ def get_prompt(task: str) -> ChatPromptTemplate:
 
     Inputs:
         task: Stable task name such as `research`, `qualitative_assessment`,
-            `leg_rationale`, or `accumulator_rationale`.
+            `accumulator_builder`, or `accumulator_rationale`.
 
     Outputs:
         The reusable `ChatPromptTemplate` bound to the resolved task key.
@@ -182,11 +268,14 @@ def get_prompt(task: str) -> ChatPromptTemplate:
 
 __all__ = [
     "ACCUMULATOR_RATIONALE_PROMPT",
-    "LEG_RATIONALE_PROMPT",
+    "ACCUMULATOR_BUILDER_PROMPT",
+    "MARKET_RESOLUTION_PROMPT",
+    "MARKET_SCORING_PROMPT",
     "NEWS_CONTEXT_ANALYSIS_PROMPT",
     "PROMPT_REGISTRY",
     "PROMPT_TASK_KEYS",
     "QUALITATIVE_ASSESSMENT_PROMPT",
+    "RANKING_PROMPT",
     "get_prompt",
     "resolve_prompt_task",
 ]

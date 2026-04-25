@@ -187,6 +187,45 @@ async def test_fetch_markets_normalizes_payload_and_reuses_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_markets_resolves_interval_goal_market_endpoint() -> None:
+    """SportyBet interval labels must replace X with the fetched endpoint minute."""
+
+    payload = build_match_detail_payload()
+    payload["data"]["event"]["markets"].append(
+        {
+            "id": 99901,
+            "name": "Total Goals from 1 to X min",
+            "specifier": "from=1|to=15|total=0.5",
+            "groupId": "1003",
+            "group": "Intervals",
+            "outcomes": [
+                {"id": "u015", "desc": "Under 0.5", "odds": 112, "isActive": True},
+                {"id": "o015", "desc": "Over 0.5", "odds": 550, "isActive": True},
+            ],
+        }
+    )
+    cache = RedisClient(redis_client=FakeAsyncRedis())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    client = SportyBetAPIClient(
+        cache,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    rows = await client.fetch_markets("sr:match:61301159", fixture=build_fixture())
+    interval_rows = [
+        row for row in rows if row.provider_market_name == "Total Goals from 1 to 15 min"
+    ]
+
+    assert len(interval_rows) == 2
+    assert all(row.market_label == "Total Goals from 1 to 15 min" for row in interval_rows)
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_fetch_markets_falls_back_to_second_endpoint_and_rotates_user_agents() -> None:
     """Endpoint fallback should continue after one failed template and rotate headers."""
 

@@ -100,31 +100,49 @@ TASK_LLM_CONFIGS: dict[str, LLMTaskConfig] = {
     "default": LLMTaskConfig(
         task_key="default",
         temperature=0.3,
-        max_tokens=500,
+        max_tokens=8000,
         description="General-purpose fallback settings for uncategorized agent calls.",
     ),
     "research": LLMTaskConfig(
         task_key="research",
         temperature=0.3,
-        max_tokens=500,
+        max_tokens=24000,
         description="News-context analysis for fixture narratives and qualitative signals.",
     ),
     "qualitative_assessment": LLMTaskConfig(
         task_key="qualitative_assessment",
         temperature=0.3,
-        max_tokens=300,
+        max_tokens=12000,
         description="Compact qualitative scoring based on fixture context and research.",
     ),
-    "leg_rationale": LLMTaskConfig(
-        task_key="leg_rationale",
-        temperature=0.2,
-        max_tokens=100,
-        description="Short rationale generation for one accumulator leg.",
+    "market_scoring": LLMTaskConfig(
+        task_key="market_scoring",
+        temperature=0.35,
+        max_tokens=24000,
+        description="Model-led market scoring and recommendation for one fixture.",
+    ),
+    "ranking": LLMTaskConfig(
+        task_key="ranking",
+        temperature=0.25,
+        max_tokens=24000,
+        description="Model-led ranking of scored fixture recommendations.",
+    ),
+    "market_resolution": LLMTaskConfig(
+        task_key="market_resolution",
+        temperature=0.25,
+        max_tokens=24000,
+        description="Model-led exact SportyBet market-row selection.",
+    ),
+    "accumulator_builder": LLMTaskConfig(
+        task_key="accumulator_builder",
+        temperature=0.4,
+        max_tokens=32000,
+        description="Model-led accumulator portfolio construction.",
     ),
     "accumulator_rationale": LLMTaskConfig(
         task_key="accumulator_rationale",
         temperature=0.2,
-        max_tokens=150,
+        max_tokens=10000,
         description="Short rationale generation for a full accumulator slip.",
     ),
 }
@@ -134,7 +152,11 @@ TASK_ALIASES: dict[str, str] = {
     "context_analysis": "research",
     "qualitative": "qualitative_assessment",
     "qualitative_score": "qualitative_assessment",
-    "leg_explanation": "leg_rationale",
+    "score": "market_scoring",
+    "scoring": "market_scoring",
+    "market_score": "market_scoring",
+    "resolve_market": "market_resolution",
+    "accumulator_building": "accumulator_builder",
     "accumulator_explanation": "accumulator_rationale",
 }
 
@@ -161,7 +183,7 @@ def resolve_task_config(task: str = "default") -> LLMTaskConfig:
 
     Inputs:
         task: Stable task key used by pipeline stages, such as `research` or
-            `leg_rationale`. Blank values resolve to `default`.
+            `accumulator_rationale`. Blank values resolve to `default`.
 
     Outputs:
         The validated `LLMTaskConfig` for the requested task.

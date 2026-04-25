@@ -61,6 +61,8 @@ _FIXTURE_MATCH_TIME_WINDOW: Final[timedelta] = timedelta(hours=18)
 _MATCH_NEWS_LOOKBACK_DAYS: Final[int] = 7
 _DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRIES: Final[int] = 2
 _DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRY_BACKOFF_SECONDS: Final[float] = 1.0
+_DEFAULT_SPORTYBET_MARKET_CONCURRENCY: Final[int] = 8
+_DEFAULT_SPORTYBET_FIXTURE_DETAIL_CONCURRENCY: Final[int] = 3
 _TEAM_STOP_WORDS: Final[frozenset[str]] = frozenset(
     {
         "ac",
@@ -324,6 +326,11 @@ class ProviderOrchestrator:
         sportybet_fixture_detail_retry_backoff_seconds: float = (
             _DEFAULT_SPORTYBET_FIXTURE_DETAIL_RETRY_BACKOFF_SECONDS
         ),
+        sportybet_market_concurrency: int = _DEFAULT_SPORTYBET_MARKET_CONCURRENCY,
+        sportybet_fixture_detail_concurrency: int = (
+            _DEFAULT_SPORTYBET_FIXTURE_DETAIL_CONCURRENCY
+        ),
+        sportybet_fixture_detail_limit: int | None = None,
         sleep: Callable[[float], Awaitable[object]] | None = None,
     ) -> None:
         """Initialize provider instances and the route catalog.
@@ -345,6 +352,12 @@ class ProviderOrchestrator:
                 SportyBet fixture-detail fetch after the initial attempt.
             sportybet_fixture_detail_retry_backoff_seconds: Delay between
                 SportyBet fixture-detail retries.
+            sportybet_market_concurrency: Maximum concurrent SportyBet market
+                fetches during one ingestion pass.
+            sportybet_fixture_detail_concurrency: Maximum concurrent SportyBet
+                fixture-page detail fetches during one ingestion pass.
+            sportybet_fixture_detail_limit: Optional upper bound for
+                fixture-page detail fetches in local or constrained runs.
             sleep: Optional async sleep function override used for tests.
         """
 
@@ -354,6 +367,12 @@ class ProviderOrchestrator:
             raise ValueError(
                 "sportybet_fixture_detail_retry_backoff_seconds must be zero or positive."
             )
+        if sportybet_market_concurrency <= 0:
+            raise ValueError("sportybet_market_concurrency must be positive.")
+        if sportybet_fixture_detail_concurrency <= 0:
+            raise ValueError("sportybet_fixture_detail_concurrency must be positive.")
+        if sportybet_fixture_detail_limit is not None and sportybet_fixture_detail_limit <= 0:
+            raise ValueError("sportybet_fixture_detail_limit must be positive when set.")
 
         self._settings = get_settings()
         self._cache = cache
@@ -365,6 +384,9 @@ class ProviderOrchestrator:
         self._sportybet_fixture_detail_retry_backoff_seconds = (
             sportybet_fixture_detail_retry_backoff_seconds
         )
+        self._sportybet_market_concurrency = sportybet_market_concurrency
+        self._sportybet_fixture_detail_concurrency = sportybet_fixture_detail_concurrency
+        self._sportybet_fixture_detail_limit = sportybet_fixture_detail_limit
 
         if self._cache is None and any(
             provider is None
@@ -510,7 +532,16 @@ class ProviderOrchestrator:
 
         if soccer_fixtures:
             providers_attempted.append("sportybet_fixture_stats")
-            for fixture in soccer_fixtures:
+            limited_soccer_fixtures, skipped_count = self._limit_sportybet_detail_fixtures(
+                soccer_fixtures
+            )
+            if skipped_count:
+                warnings.append(
+                    "SportyBet stats limited to "
+                    f"{len(limited_soccer_fixtures)} of {len(soccer_fixtures)} soccer "
+                    "fixtures by the configured fixture-detail limit."
+                )
+            for fixture in limited_soccer_fixtures:
                 fixture_ref = fixture.get_fixture_ref()
                 try:
                     stats_result = await self._get_or_fetch_sportybet_fixture_stats_result(
@@ -595,6 +626,7 @@ class ProviderOrchestrator:
         football_fixtures = tuple(
             fixture for fixture in fixtures if fixture.sport == SportName.SOCCER
         )
+        football_fixture_count = len(football_fixtures)
         if not football_fixtures:
             return FixtureDetailsFetchResult(
                 fixture_details=(),
@@ -605,36 +637,112 @@ class ProviderOrchestrator:
         providers_attempted = ("sportybet_fixture_stats",)
         fixture_details: list[FixtureDetails] = []
         warnings: list[str] = []
+        football_fixtures, skipped_count = self._limit_sportybet_detail_fixtures(
+            football_fixtures
+        )
+        if skipped_count:
+            warnings.append(
+                "SportyBet fixture details limited to "
+                f"{len(football_fixtures)} of {football_fixture_count} "
+                "soccer fixtures by the configured fixture-detail limit."
+            )
 
-        for fixture in football_fixtures:
+        semaphore = asyncio.Semaphore(self._sportybet_fixture_detail_concurrency)
+
+        async def fetch_one_fixture_detail(
+            fixture: NormalizedFixture,
+        ) -> tuple[FixtureDetails | None, str | None]:
             fixture_ref = fixture.get_fixture_ref()
             try:
-                stats_result = await self._get_or_fetch_sportybet_fixture_stats_result(
-                    fixture
-                )
+                async with semaphore:
+                    stats_result = await self._get_or_fetch_sportybet_fixture_stats_result(
+                        fixture
+                    )
+                    self._validate_sportybet_widget_coverage(
+                        fixture_ref=fixture_ref,
+                        stats_result=stats_result,
+                    )
             except ValueError as exc:
-                warnings.append(f"SportyBet fixture details skipped for {fixture_ref}: {exc}")
-                continue
+                return (
+                    None,
+                    f"SportyBet fixture details skipped for {fixture_ref}: {exc}",
+                )
             except Exception as exc:
                 warning = (
                     f"SportyBet fixture details fetch failed for {fixture_ref}: {exc}"
                 )
                 logger.warning(warning)
-                warnings.append(warning)
-                continue
+                return (None, warning)
 
-            fixture_details.append(
+            return (
                 build_fixture_details_snapshot(
                     stats_result,
                     fixture_ref=fixture_ref,
-                )
+                ),
+                None,
             )
+
+        detail_results = await asyncio.gather(
+            *(fetch_one_fixture_detail(fixture) for fixture in football_fixtures)
+        )
+        for fixture_detail, warning in detail_results:
+            if fixture_detail is not None:
+                fixture_details.append(fixture_detail)
+            if warning is not None:
+                warnings.append(warning)
 
         return FixtureDetailsFetchResult(
             fixture_details=tuple(fixture_details),
             providers_attempted=providers_attempted,
             warnings=tuple(warnings),
         )
+
+    def _validate_sportybet_widget_coverage(
+        self,
+        *,
+        fixture_ref: str,
+        stats_result: SportyBetFixtureStatsResult,
+    ) -> None:
+        """Require every configured SportyBet widget to mount for fixture context."""
+
+        expected_widget_keys = set(self._sportybet_fixture_stats_scraper.widget_keys)
+        widgets_by_key = {widget.widget_key: widget for widget in stats_result.widgets}
+        missing_widget_keys = sorted(expected_widget_keys - set(widgets_by_key))
+        failed_widget_keys = sorted(
+            widget.widget_key
+            for widget in widgets_by_key.values()
+            if widget.widget_key in expected_widget_keys and widget.status != "mounted"
+        )
+        readable_widget_keys = sorted(
+            widget.widget_key
+            for widget in widgets_by_key.values()
+            if widget.widget_key in expected_widget_keys and widget.content_lines
+        )
+        if not missing_widget_keys and not failed_widget_keys and readable_widget_keys:
+            return
+
+        details: list[str] = []
+        if missing_widget_keys:
+            details.append(f"missing widgets: {', '.join(missing_widget_keys)}")
+        if failed_widget_keys:
+            details.append(f"failed widgets: {', '.join(failed_widget_keys)}")
+        if not readable_widget_keys:
+            details.append("no widget returned readable content lines")
+        raise RuntimeError(
+            f"SportyBet fixture widgets incomplete for {fixture_ref}: "
+            + "; ".join(details)
+        )
+
+    def _limit_sportybet_detail_fixtures(
+        self,
+        fixtures: tuple[NormalizedFixture, ...],
+    ) -> tuple[tuple[NormalizedFixture, ...], int]:
+        """Apply the optional SportyBet fixture-detail fetch limit."""
+
+        if self._sportybet_fixture_detail_limit is None:
+            return fixtures, 0
+        limited = fixtures[: self._sportybet_fixture_detail_limit]
+        return limited, max(0, len(fixtures) - len(limited))
 
     async def _get_or_fetch_sportybet_fixture_stats_result(
         self,
@@ -1080,22 +1188,52 @@ class ProviderOrchestrator:
         unmatched_fixture_refs: list[str] = []
         fixture_map = {fixture.get_fixture_ref(): fixture for fixture in fixtures}
 
-        for fixture in fixtures:
+        semaphore = asyncio.Semaphore(self._sportybet_market_concurrency)
+
+        async def fetch_one_fixture_markets(
+            fixture: NormalizedFixture,
+        ) -> tuple[str, tuple[NormalizedOdds, ...], tuple[str, ...], str | None]:
+            fixture_ref = fixture.get_fixture_ref()
+            fixture_providers_attempted: list[str] = []
             try:
-                fixture_rows = await self._fetch_sportybet_rows_for_fixture(
-                    fixture=fixture,
-                    providers_attempted=providers_attempted,
-                )
+                async with semaphore:
+                    fixture_rows = await self._fetch_sportybet_rows_for_fixture(
+                        fixture=fixture,
+                        providers_attempted=fixture_providers_attempted,
+                    )
             except ProviderError as exc:
                 warning = (
                     "SportyBet odds fetch failed for "
-                    f"{fixture.get_fixture_ref()}: {exc}"
+                    f"{fixture_ref}: {exc}"
                 )
                 logger.warning(warning)
-                warnings.append(warning)
-                unmatched_fixture_refs.append(fixture.get_fixture_ref())
-                continue
+                return (fixture_ref, (), tuple(fixture_providers_attempted), warning)
 
+            return (
+                fixture_ref,
+                fixture_rows,
+                tuple(fixture_providers_attempted),
+                None,
+            )
+
+        market_results = await asyncio.gather(
+            *(fetch_one_fixture_markets(fixture) for fixture in fixtures)
+        )
+        attempted_provider_names = {
+            provider_name
+            for _, _, fixture_providers_attempted, _ in market_results
+            for provider_name in fixture_providers_attempted
+        }
+        providers_attempted.extend(
+            provider_name
+            for provider_name in ("sportybet_api", "sportybet_browser")
+            if provider_name in attempted_provider_names
+        )
+        for fixture_ref, fixture_rows, _, warning in market_results:
+            if warning is not None:
+                warnings.append(warning)
+                unmatched_fixture_refs.append(fixture_ref)
+                continue
             matched_rows.extend(fixture_rows)
 
         sport_by_fixture = {

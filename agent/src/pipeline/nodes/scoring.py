@@ -1,34 +1,30 @@
-"""Scoring node for PuntLab's LangGraph pipeline.
+"""LLM scoring node for PuntLab's LangGraph pipeline.
 
-Purpose: translate ingested fixtures, canonically mapped odds, team stats, and
-research-stage contexts into validated `MatchScore` outputs for ranking.
-Scope: fixture-by-fixture scoring orchestration, conservative injury/context
-matching, and recoverable diagnostics when individual fixtures cannot be
-scored cleanly.
-Dependencies: `src.scoring.ScoringEngine` for composite score calculation and
-`src.pipeline.state.PipelineState` for validated state IO between LangGraph
-stages.
+Purpose: translate SportyBet fixtures, fixture details, markets, injuries, and
+research-stage contexts into model-selected `MatchScore` outputs for ranking.
+Scope: fixture-by-fixture LLM market scoring with prompt-level JSON validation
+and fail-fast behavior.
+Dependencies: `src.llm`, SportyBet market snapshots, and validated pipeline
+state.
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from src.llm import get_llm, get_prompt
+from src.pipeline.llm_json import invoke_json_schema
+from src.pipeline.nodes.research import (
+    _build_fixture_summary,
+    _render_fixture_details,
+    _render_known_absences,
+)
 from src.pipeline.state import PipelineStage, PipelineState
-from src.schemas.analysis import MatchContext, MatchScore
-from src.schemas.fixtures import NormalizedFixture
-from src.schemas.stats import InjuryData, TeamStats
+from src.providers.odds_mapping import build_fixture_market_snapshots
+from src.schemas.analysis import MatchContext, MatchScore, ScoreFactorBreakdown
+from src.schemas.stats import InjuryData
 from src.scoring import ScoringEngine
-
-_SCORING_FAILURE_PATTERN = re.compile(
-    r"^Scoring failed for (?P<fixture>.+?): (?P<reason>.+)$"
-)
-_FIXTURE_IDENTIFIER_PATTERN = re.compile(
-    r"\b(?:sr:match:\d+|api-football:\d+|balldontlie:\d+)\b",
-    flags=re.IGNORECASE,
-)
 
 
 async def scoring_node(
@@ -52,40 +48,69 @@ async def scoring_node(
     validated_state = (
         state if isinstance(state, PipelineState) else PipelineState.model_validate(state)
     )
-    scoring_engine = engine or ScoringEngine()
+    if engine is not None:
+        raise RuntimeError(
+            "scoring_node is LLM-led; deterministic ScoringEngine injection is disabled."
+        )
 
     context_by_fixture = _context_index(validated_state.match_contexts)
-    diagnostics: list[str] = []
+    fixture_details_by_fixture = {
+        details.fixture_ref: details for details in validated_state.fixture_details
+    }
+    market_snapshots = build_fixture_market_snapshots(
+        validated_state.fixtures,
+        validated_state.odds_market_catalog,
+    )
+    market_snapshot_by_fixture = {
+        snapshot.fixture_ref: snapshot for snapshot in market_snapshots
+    }
+    resolved_llm = await get_llm("market_scoring")
+    prompt = get_prompt("market_scoring")
     match_scores: list[MatchScore] = []
 
     for fixture in validated_state.fixtures:
-        team_stats = _fixture_team_stats(fixture, validated_state.team_stats)
         fixture_context = context_by_fixture.get(fixture.get_fixture_ref())
+        if fixture_context is None:
+            raise RuntimeError(
+                f"LLM scoring requires research context for {fixture.get_fixture_ref()}."
+            )
         fixture_injuries = _fixture_injuries(fixture, validated_state.injuries)
-
-        try:
-            match_scores.append(
-                scoring_engine.calculate_match_score(
-                    fixture,
-                    team_stats,
-                    validated_state.odds_data,
-                    context=fixture_context,
-                    injuries=fixture_injuries,
-                    h2h_data=None,
-                )
+        prompt_messages = prompt.format_messages(
+            fixture_summary=_build_fixture_summary(fixture),
+            match_context_summary=_render_match_context_summary(fixture_context),
+            fixture_details=_render_fixture_details(
+                fixture_details_by_fixture.get(fixture.get_fixture_ref())
+            ),
+            known_absences=_render_known_absences(fixture, fixture_injuries or ()),
+            market_menu=_render_scoring_market_menu(
+                market_snapshot_by_fixture.get(fixture.get_fixture_ref())
+            ),
+        )
+        score = await invoke_json_schema(
+            llm=resolved_llm,
+            prompt_messages=prompt_messages,
+            schema=MatchScore,
+            instruction=_match_score_json_instruction(),
+        )
+        match_scores.append(
+            score.model_copy(
+                update={
+                    "fixture_ref": fixture.get_fixture_ref(),
+                    "sport": fixture.sport,
+                    "competition": fixture.competition,
+                    "home_team": fixture.home_team,
+                    "away_team": fixture.away_team,
+                    "factors": score.factors
+                    if isinstance(score.factors, ScoreFactorBreakdown)
+                    else ScoreFactorBreakdown.model_validate(score.factors),
+                }
             )
-        except (TypeError, ValueError) as exc:
-            diagnostics.append(
-                f"Scoring failed for {fixture.get_fixture_ref()}: {exc}"
-            )
+        )
 
     return {
         "current_stage": PipelineStage.RANKING,
         "match_scores": match_scores,
-        "errors": _merge_diagnostics(
-            validated_state.errors,
-            _summarize_scoring_diagnostics(diagnostics),
-        ),
+        "errors": list(validated_state.errors),
     }
 
 
@@ -107,49 +132,8 @@ def _context_index(contexts: Sequence[MatchContext]) -> dict[str, MatchContext]:
     return indexed_contexts
 
 
-def _fixture_team_stats(
-    fixture: NormalizedFixture,
-    team_stats: Sequence[TeamStats],
-) -> tuple[TeamStats, ...]:
-    """Return same-sport team stats that could plausibly match the fixture.
-
-    Inputs:
-        fixture: Fixture currently being scored.
-        team_stats: Full state-level team-stat slate gathered during ingestion.
-
-    Outputs:
-        A tuple of same-sport team snapshots that exactly match the fixture's
-        team IDs or team names while preserving source order.
-    """
-
-    relevant_stats = tuple(stats for stats in team_stats if stats.sport == fixture.sport)
-    if not relevant_stats:
-        return ()
-
-    exact_matches = tuple(
-        stats
-        for stats in relevant_stats
-        if _team_stats_match_fixture_team(stats, fixture)
-    )
-    return exact_matches
-
-
-def _team_stats_match_fixture_team(
-    stats: TeamStats,
-    fixture: NormalizedFixture,
-) -> bool:
-    """Report whether a team-stat row likely belongs to either fixture team."""
-
-    team_name = stats.team_name.casefold()
-    if team_name in {fixture.home_team.casefold(), fixture.away_team.casefold()}:
-        return True
-    if stats.team_id in {fixture.home_team_id, fixture.away_team_id}:
-        return True
-    return False
-
-
 def _fixture_injuries(
-    fixture: NormalizedFixture,
+    fixture: object,
     injuries: Sequence[InjuryData],
 ) -> tuple[InjuryData, ...] | None:
     """Return fixture-scoped injuries or `None` when no structured rows exist.
@@ -164,86 +148,105 @@ def _fixture_injuries(
         engine should remain conservative.
     """
 
-    fixture_rows = tuple(
-        injury for injury in injuries if injury.fixture_ref == fixture.get_fixture_ref()
-    )
+    fixture_ref = fixture.get_fixture_ref()
+    fixture_rows = tuple(injury for injury in injuries if injury.fixture_ref == fixture_ref)
     return fixture_rows or None
 
 
-def _merge_diagnostics(existing_errors: Sequence[str], diagnostics: Sequence[str]) -> list[str]:
-    """Append new diagnostics to the pipeline error list without duplicates."""
+def _render_match_context_summary(context: MatchContext) -> str:
+    """Render one research context for the market-scoring prompt."""
 
-    merged_errors = list(existing_errors)
-    seen_messages = {message.casefold() for message in merged_errors}
+    parts = [
+        f"fixture_ref={context.fixture_ref}",
+        f"qualitative_score={context.qualitative_score:.2f}",
+        f"fixture_detail_summary={context.fixture_detail_summary}",
+    ]
+    optional_fields = (
+        ("tactical_context", context.tactical_context),
+        ("statistical_context", context.statistical_context),
+        ("availability_context", context.availability_context),
+        ("market_context", context.market_context),
+        ("supplemental_news_context", context.supplemental_news_context),
+    )
+    for label, value in optional_fields:
+        if value:
+            parts.append(f"{label}={value}")
+    parts.append(f"data_sources={', '.join(context.data_sources)}")
+    return "; ".join(parts)
 
-    for diagnostic in diagnostics:
-        lookup_key = diagnostic.casefold()
-        if lookup_key in seen_messages:
-            continue
-        seen_messages.add(lookup_key)
-        merged_errors.append(diagnostic)
 
-    return merged_errors
+def _match_score_json_instruction() -> str:
+    """Return the strict JSON contract for model-led market scoring."""
+
+    return (
+        "Return a MatchScore JSON object with keys: fixture_ref, sport, competition, "
+        "home_team, away_team, composite_score, confidence, factors, recommended_market, "
+        "recommended_market_label, recommended_canonical_market, recommended_selection, "
+        "recommended_odds, recommended_line, qualitative_summary. factors must include "
+        "form, h2h, injury_impact, odds_value, context, venue, statistical. Use numbers "
+        "between 0 and 1 for score fields. recommended_market must be an exact provider "
+        "market key from the menu. recommended_selection and recommended_odds must match "
+        "one exact menu selection. Use null only for recommended_canonical_market or "
+        "recommended_line when unavailable."
+    )
 
 
-def _summarize_scoring_diagnostics(diagnostics: Sequence[str]) -> tuple[str, ...]:
-    """Compress repetitive fixture-level scoring failures by shared reason.
+def _render_scoring_market_menu(snapshot: object | None) -> str:
+    """Render a compact market menu for LLM scoring."""
 
-    Inputs:
-        diagnostics: Ordered scoring diagnostics collected per fixture.
+    if snapshot is None or getattr(snapshot, "fetched_market_count", 0) == 0:
+        return "No SportyBet market snapshot was available for this fixture."
 
-    Outputs:
-        A tuple where repeated fixture-specific failures are grouped into one
-        message per root cause, while one-off diagnostics remain unchanged.
-    """
+    priority_tokens = (
+        "1x2",
+        "full_time",
+        "result",
+        "double",
+        "draw",
+        "btts",
+        "both",
+        "over",
+        "under",
+        "total",
+        "goals",
+        "handicap",
+    )
+    market_entries: list[object] = []
+    for group in snapshot.market_groups:
+        for market in group.markets:
+            key_text = (
+                f"{market.provider_market_key} {market.market_label} "
+                f"{market.provider_market_name}"
+            ).casefold()
+            priority = 0 if any(token in key_text for token in priority_tokens) else 1
+            market_entries.append((priority, market))
 
-    summarized: list[str] = []
-    failures_by_reason: dict[str, list[str]] = {}
-    reason_examples: dict[str, str] = {}
-
-    for diagnostic in diagnostics:
-        match = _SCORING_FAILURE_PATTERN.match(diagnostic)
-        if match is None:
-            summarized.append(diagnostic)
-            continue
-        raw_reason = match.group("reason").strip()
-        reason = _normalize_scoring_failure_reason(raw_reason)
-        fixture_ref = match.group("fixture").strip()
-        failures_by_reason.setdefault(reason, []).append(fixture_ref)
-        reason_examples.setdefault(reason, raw_reason)
-
-    for reason, fixture_refs in failures_by_reason.items():
-        if len(fixture_refs) == 1:
-            reason_for_single = reason_examples.get(reason, reason)
-            summarized.append(
-                f"Scoring failed for {fixture_refs[0]}: {reason_for_single}"
-            )
-            continue
-        normalized_reason = reason.rstrip(".")
-        sample_refs = ", ".join(fixture_refs[:3])
-        summarized.append(
-            "Scoring failed for "
-            f"{len(fixture_refs)} fixtures due to: {normalized_reason}. "
-            f"Sample fixtures: {sample_refs}."
+    ordered_entries = [market for _, market in sorted(market_entries, key=lambda item: item[0])]
+    lines = [
+        (
+            "SportyBet compact scoring menu: "
+            f"{snapshot.fetched_market_count} markets fetched; showing "
+            f"{min(len(ordered_entries), 30)} prioritized markets."
         )
+    ]
+    for market in ordered_entries[:30]:
+        selections = " | ".join(
+            _format_scoring_selection(selection)
+            for selection in market.selections[:6]
+        )
+        lines.append(f"- {market.market_label} [key={market.provider_market_key}]: {selections}")
+    if len(ordered_entries) > 30:
+        lines.append(f"- {len(ordered_entries) - 30} additional markets omitted.")
+    return "\n".join(lines)
 
-    return tuple(summarized)
 
+def _format_scoring_selection(selection: object) -> str:
+    """Render one selection for the compact scoring menu."""
 
-def _normalize_scoring_failure_reason(reason: str) -> str:
-    """Normalize variable fixture-specific fragments in scoring failures.
-
-    Inputs:
-        reason: Raw exception text raised while scoring one fixture.
-
-    Outputs:
-        A normalized root-cause string that keeps semantic detail while
-        removing fixture-specific identifiers that fragment aggregation.
-    """
-
-    normalized = " ".join(reason.split())
-    normalized = _FIXTURE_IDENTIFIER_PATTERN.sub("<fixture>", normalized)
-    return normalized
+    label = selection.provider_selection_name
+    if selection.line is not None and str(selection.line) not in label:
+        label += f" ({selection.line:g})"
+    return f"{label} {selection.odds:.2f}"
 
 
 __all__ = ["scoring_node"]

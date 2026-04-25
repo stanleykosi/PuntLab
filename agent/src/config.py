@@ -120,7 +120,7 @@ class LLMProviderConfig(BaseModel):
     primary_provider: str = "openrouter"
     secondary_provider: str = "openai"
     fallback_provider: str = "anthropic"
-    primary_model: str = "qwen/qwen3.6-plus:free"
+    primary_model: str = "tencent/hy3-preview:free"
     secondary_model: str = "gpt-4o"
     fallback_model: str = "claude-sonnet-4-20250514"
 
@@ -501,7 +501,7 @@ class Settings(BaseSettings):
     llm_secondary_provider: str = Field(default="openai", alias="LLM_SECONDARY_PROVIDER")
     llm_fallback_provider: str = Field(default="anthropic", alias="LLM_FALLBACK_PROVIDER")
     llm_primary_model: str = Field(
-        default="qwen/qwen3.6-plus:free",
+        default="tencent/hy3-preview:free",
         alias="LLM_PRIMARY_MODEL",
     )
     llm_secondary_model: str = Field(default="gpt-4o", alias="LLM_SECONDARY_MODEL")

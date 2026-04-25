@@ -72,6 +72,10 @@ async def analyze_context(
             "No structured absences feed was provided to this factor. Use only"
             " article-backed availability context."
         ),
+        fixture_details=(
+            "No SportyBet fixture-page widget details were supplied to this legacy "
+            "context factor."
+        ),
         recent_news_bullets=_render_news_bullets(relevant_articles),
         source_labels=", ".join(_ordered_unique_sources(relevant_articles)),
     )

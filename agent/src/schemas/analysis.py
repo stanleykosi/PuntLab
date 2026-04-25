@@ -55,15 +55,15 @@ def _normalize_unique_sources(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 class MatchContext(BaseModel):
-    """LLM-generated qualitative context for a single fixture.
+    """LLM-generated SportyBet fixture context for a single fixture.
 
     Inputs:
-        Fixture-aware research prompts grounded in current news and known match
-        narratives.
+        Fixture-aware research prompts grounded first in SportyBet pre-match
+        fixture-page widgets, with RSS/Tavily news only as supplemental context.
 
     Outputs:
-        A normalized context object with bounded morale, pressure, rivalry, and
-        aggregate qualitative scoring signals.
+        A normalized context object with compact SportyBet-derived summaries and
+        an aggregate qualitative score for downstream LLM market scoring.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -72,73 +72,53 @@ class MatchContext(BaseModel):
         default=None,
         description="Fixture reference tied to this context when already known.",
     )
-    morale_home: float = Field(ge=0.0, le=1.0, description="Home-team morale score.")
-    morale_away: float = Field(ge=0.0, le=1.0, description="Away-team morale score.")
-    rivalry_factor: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Normalized derby or rivalry intensity signal.",
-    )
-    pressure_home: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Home-team pressure score driven by table or narrative stakes.",
-    )
-    pressure_away: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Away-team pressure score driven by table or narrative stakes.",
-    )
-    key_narrative: str = Field(
+    fixture_detail_summary: str = Field(
         min_length=1,
-        max_length=200,
-        description="Short narrative summary describing the match context.",
+        max_length=600,
+        description="Primary summary derived from SportyBet fixture-page widgets.",
+    )
+    tactical_context: str | None = Field(
+        default=None,
+        max_length=600,
+        description="Lineup, formation, style, or matchup context from SportyBet widgets.",
+    )
+    statistical_context: str | None = Field(
+        default=None,
+        max_length=600,
+        description="Statistics, comparison, H2H, table, or probability context.",
+    )
+    availability_context: str | None = Field(
+        default=None,
+        max_length=600,
+        description="Absence, lineup, suspension, or team-info context when available.",
+    )
+    market_context: str | None = Field(
+        default=None,
+        max_length=600,
+        description="Concise read of relevant SportyBet market shape without a final pick.",
+    )
+    supplemental_news_context: str | None = Field(
+        default=None,
+        max_length=500,
+        description="RSS/Tavily context used only to enrich SportyBet fixture detail analysis.",
     )
     qualitative_score: float = Field(
         ge=0.0,
         le=1.0,
-        description="Overall qualitative context score used by downstream scoring.",
+        description="Overall confidence in the fixture context quality and betting signal.",
     )
     data_sources: tuple[str, ...] = Field(
         default=(),
         description="Ordered list of source labels used to form the context.",
     )
-    news_summary: str | None = Field(
-        default=None,
-        description="Optional condensed summary of the supporting news context.",
-    )
-    suggested_market: str | None = Field(
-        default=None,
-        description="Provider-native market key suggested from the supplied market menu.",
-    )
-    suggested_market_label: str | None = Field(
-        default=None,
-        description="Display label for the suggested provider market.",
-    )
-    suggested_canonical_market: MarketType | None = Field(
-        default=None,
-        description="Canonical market hint when the suggested market maps into PuntLab taxonomy.",
-    )
-    suggested_selection: str | None = Field(
-        default=None,
-        description="Exact provider-facing selection suggested from the market menu.",
-    )
-    suggested_odds: float | None = Field(
-        default=None,
-        gt=1.0,
-        description="Decimal odds tied to the suggested selection when present in the menu.",
-    )
-    suggested_line: float | None = Field(
-        default=None,
-        description="Numeric line associated with the suggested market when applicable.",
-    )
 
     @field_validator(
         "fixture_ref",
-        "news_summary",
-        "suggested_market",
-        "suggested_market_label",
-        "suggested_selection",
+        "tactical_context",
+        "statistical_context",
+        "availability_context",
+        "market_context",
+        "supplemental_news_context",
     )
     @classmethod
     def validate_optional_text(cls, value: str | None) -> str | None:
@@ -146,55 +126,31 @@ class MatchContext(BaseModel):
 
         return normalize_optional_text(value)
 
-    @field_validator("key_narrative")
+    @field_validator("fixture_detail_summary")
     @classmethod
-    def validate_key_narrative(cls, value: str) -> str:
-        """Reject blank narratives after whitespace normalization."""
+    def validate_fixture_detail_summary(cls, value: str) -> str:
+        """Reject blank fixture summaries after whitespace normalization."""
 
-        return require_non_blank_text(value, "key_narrative")
+        return require_non_blank_text(value, "fixture_detail_summary")
 
-    @field_validator(
-        "morale_home",
-        "morale_away",
-        "rivalry_factor",
-        "pressure_home",
-        "pressure_away",
-        "qualitative_score",
-        "suggested_odds",
-        "suggested_line",
-    )
+    @field_validator("qualitative_score")
     @classmethod
-    def validate_bounded_scores(cls, value: float | None, info: object) -> float | None:
+    def validate_bounded_scores(cls, value: float, info: object) -> float:
         """Reject non-finite scoring inputs before bound checks are trusted."""
 
-        if value is None:
-            return None
         field_name = getattr(info, "field_name", "value")
         return require_finite_number(value, field_name)
 
-    @field_validator("data_sources")
+    @field_validator("data_sources", mode="before")
     @classmethod
-    def validate_data_sources(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def validate_data_sources(cls, value: object) -> tuple[str, ...]:
         """Require at least one unique source for qualitative context."""
 
-        return _normalize_unique_sources(value)
-
-    @model_validator(mode="after")
-    def validate_suggested_market_shape(self) -> Self:
-        """Require coherent suggested-market fields when the model proposes one."""
-
-        if self.suggested_canonical_market is None and self.suggested_market is not None:
-            with suppress(ValueError):
-                self.suggested_canonical_market = MarketType(self.suggested_market)
-        if self.suggested_market is not None and self.suggested_selection is None:
-            raise ValueError(
-                "suggested_selection is required when suggested_market is provided."
-            )
-        if self.suggested_odds is not None and self.suggested_market is None:
-            raise ValueError(
-                "suggested_market is required when suggested_odds is provided."
-            )
-        return self
+        if isinstance(value, str):
+            return _normalize_unique_sources((value,))
+        if isinstance(value, list | tuple):
+            return _normalize_unique_sources(tuple(str(item) for item in value))
+        return _normalize_unique_sources(())
 
 
 class QualitativeScore(BaseModel):
@@ -278,12 +234,16 @@ class QualitativeScore(BaseModel):
         field_name = getattr(info, "field_name", "value")
         return require_finite_number(value, field_name)
 
-    @field_validator("data_sources")
+    @field_validator("data_sources", mode="before")
     @classmethod
-    def validate_data_sources(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def validate_data_sources(cls, value: object) -> tuple[str, ...]:
         """Require at least one unique source for qualitative scoring."""
 
-        return _normalize_unique_sources(value)
+        if isinstance(value, str):
+            return _normalize_unique_sources((value,))
+        if isinstance(value, list | tuple):
+            return _normalize_unique_sources(tuple(str(item) for item in value))
+        return _normalize_unique_sources(())
 
 
 class ScoreFactorBreakdown(BaseModel):
@@ -481,6 +441,46 @@ class MatchScore(BaseModel):
         default=None,
         description="Short human-readable context note for tracing and explanation.",
     )
+
+    @field_validator("sport", mode="before")
+    @classmethod
+    def validate_sport_label(cls, value: object) -> object:
+        """Normalize common LLM-facing sport labels into canonical enum values."""
+
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"football", "soccer"}:
+                return SportName.SOCCER
+            if normalized in {"basketball", "nba"}:
+                return SportName.BASKETBALL
+        return value
+
+    @field_validator("recommended_canonical_market", mode="before")
+    @classmethod
+    def validate_recommended_canonical_market(cls, value: object) -> object:
+        """Normalize common LLM-facing market labels into canonical enum values."""
+
+        if value is None or isinstance(value, MarketType):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+            label_map = {
+                "1x2": MarketType.MATCH_RESULT,
+                "match_result": MarketType.MATCH_RESULT,
+                "full_time_result": MarketType.MATCH_RESULT,
+                "fulltime_result": MarketType.MATCH_RESULT,
+                "btts": MarketType.BTTS,
+                "both_teams_to_score": MarketType.BTTS,
+                "double_chance": MarketType.DOUBLE_CHANCE,
+                "draw_no_bet": MarketType.DRAW_NO_BET,
+                "dnb": MarketType.DRAW_NO_BET,
+                "over_under_0.5": MarketType.OVER_UNDER_05,
+                "over_under_1.5": MarketType.OVER_UNDER_15,
+                "over_under_2.5": MarketType.OVER_UNDER_25,
+                "over_under_3.5": MarketType.OVER_UNDER_35,
+            }
+            return label_map.get(normalized, value)
+        return value
 
     @field_validator(
         "fixture_ref",

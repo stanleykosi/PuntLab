@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +29,7 @@ from src.providers.base import ProviderError, RateLimitedClient, RateLimitPolicy
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.odds import NormalizedOdds
 
+logger = logging.getLogger(__name__)
 SPORTYBET_BASE_URL: Final[str] = "https://www.sportybet.com"
 SPORTYBET_COUNTRY_CODE: Final[str] = "ng"
 SPORTYBET_API_PATH_TEMPLATES: Final[tuple[str, ...]] = (
@@ -74,6 +77,15 @@ _LINE_MARKETS: Final[frozenset[MarketType]] = frozenset(
         MarketType.POINT_SPREAD,
         MarketType.TOTAL_POINTS,
     }
+)
+_UNRESOLVED_INTERVAL_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bfrom\s+1\s+to\s+X\s+min\b",
+    flags=re.IGNORECASE,
+)
+_INTERVAL_ENDPOINT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"(?:^|[|&;,\s])(?:to|end|until|minute|minutes|min)\s*=\s*(\d{1,3})", re.I),
+    re.compile(r"(?:^|[|&;,\s])(?:to|end|until|minute|minutes|min)\s*:\s*(\d{1,3})", re.I),
+    re.compile(r"\bfrom\s*=?\s*1\b.*?(?:to|-)\s*(\d{1,3})\b", re.I),
 )
 
 
@@ -357,7 +369,18 @@ class SportyBetAPIClient:
         """Load one cached SportyBet market snapshot from Redis when present."""
 
         cache_key = RedisClient.build_sportybet_markets_key(sportradar_id)
-        cached_snapshot = await self._cache.get(cache_key, model=SportyBetMarketCacheEntry)
+        try:
+            cached_snapshot = await self._cache.get(
+                cache_key,
+                model=SportyBetMarketCacheEntry,
+            )
+        except Exception as exc:
+            logger.warning(
+                "SportyBet market cache read skipped for %s: %s",
+                sportradar_id,
+                exc,
+            )
+            return None
         if not isinstance(cached_snapshot, SportyBetMarketCacheEntry):
             return None
         return cached_snapshot.markets
@@ -375,7 +398,14 @@ class SportyBetAPIClient:
             fetched_at=self._clock().astimezone(UTC),
             markets=tuple(markets),
         )
-        await self._cache.set(cache_key, snapshot)
+        try:
+            await self._cache.set(cache_key, snapshot)
+        except Exception as exc:
+            logger.warning(
+                "SportyBet market cache write skipped for %s: %s",
+                sportradar_id,
+                exc,
+            )
 
     def _build_request_headers(self) -> dict[str, str]:
         """Build one outbound request header set with a rotated user agent."""
@@ -474,8 +504,12 @@ class SportyBetAPIClient:
         parsed_rows: list[NormalizedOdds] = []
         for market_group, market_node in event_catalog.iter_market_nodes():
             market_id = self._extract_market_id(market_node)
-            provider_market_name = self._extract_market_name(market_node, market_id)
             market_specifier = self._extract_market_specifier(market_node)
+            provider_market_name = self._resolve_market_interval_label(
+                market_name=self._extract_market_name(market_node, market_id),
+                market_node=market_node,
+                specifier=market_specifier,
+            )
             market = self._resolve_market_type(
                 sport=event_catalog.fixture.sport,
                 market_id=market_id,
@@ -730,6 +764,77 @@ class SportyBetAPIClient:
         if market_id is None:
             return "SportyBet Market"
         return f"SportyBet Market {market_id}"
+
+    def _resolve_market_interval_label(
+        self,
+        *,
+        market_name: str,
+        market_node: Mapping[str, object],
+        specifier: str | None,
+    ) -> str:
+        """Replace SportyBet interval placeholders with the fetched minute endpoint."""
+
+        if _UNRESOLVED_INTERVAL_PATTERN.search(market_name) is None:
+            return market_name
+
+        endpoint = self._extract_interval_endpoint(
+            market_node=market_node,
+            specifier=specifier,
+        )
+        if endpoint is None:
+            raise ProviderError(
+                "sportybet",
+                "interval market label retained unresolved `X`; SportyBet did not expose "
+                "a parseable endpoint minute in the market payload.",
+            )
+        return _UNRESOLVED_INTERVAL_PATTERN.sub(f"from 1 to {endpoint} min", market_name)
+
+    def _extract_interval_endpoint(
+        self,
+        *,
+        market_node: Mapping[str, object],
+        specifier: str | None,
+    ) -> int | None:
+        """Extract the `X` minute for SportyBet `from 1 to X min` markets."""
+
+        fragments: list[str] = []
+        if specifier:
+            fragments.append(specifier)
+        for key in (
+            "specifier",
+            "marketSpecifiers",
+            "marketSpecifier",
+            "param",
+            "params",
+            "value",
+            "specialOddsValue",
+            "marketName",
+            "name",
+            "desc",
+            "title",
+        ):
+            raw_value = market_node.get(key)
+            if isinstance(raw_value, (str, int, float)) and not isinstance(raw_value, bool):
+                fragments.append(str(raw_value))
+
+        for fragment in fragments:
+            for pattern in _INTERVAL_ENDPOINT_PATTERNS:
+                match = pattern.search(fragment)
+                if match is None:
+                    continue
+                endpoint = int(match.group(1))
+                if 1 < endpoint <= 120:
+                    return endpoint
+
+        candidate_values: list[int] = []
+        for fragment in fragments:
+            for match in re.finditer(r"\b(\d{1,3})\b", fragment):
+                value = int(match.group(1))
+                if 1 < value <= 120:
+                    candidate_values.append(value)
+        if candidate_values:
+            return max(candidate_values)
+        return None
 
     @staticmethod
     def _extract_market_specifier(market_node: Mapping[str, object]) -> str | None:

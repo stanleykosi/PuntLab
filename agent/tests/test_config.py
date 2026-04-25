@@ -31,7 +31,7 @@ def test_settings_parses_env_aliases_and_groups(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("LLM_PRIMARY_PROVIDER", "openrouter")
     monkeypatch.setenv("LLM_SECONDARY_PROVIDER", "openai")
     monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_PRIMARY_MODEL", "qwen/qwen3.6-plus:free")
+    monkeypatch.setenv("LLM_PRIMARY_MODEL", "tencent/hy3-preview:free")
     monkeypatch.setenv("LLM_SECONDARY_MODEL", "gpt-4o")
     monkeypatch.setenv("LLM_FALLBACK_MODEL", "claude-sonnet-4-20250514")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
@@ -54,7 +54,7 @@ def test_settings_parses_env_aliases_and_groups(monkeypatch: pytest.MonkeyPatch)
     assert settings.llm.primary_provider == "openrouter"
     assert settings.llm.secondary_provider == "openai"
     assert settings.llm.fallback_provider == "anthropic"
-    assert settings.llm.primary_model == "qwen/qwen3.6-plus:free"
+    assert settings.llm.primary_model == "tencent/hy3-preview:free"
     assert settings.llm.secondary_model == "gpt-4o"
     assert settings.llm.fallback_model == "claude-sonnet-4-20250514"
     assert settings.llm.openai_api_key == "sk-openai"

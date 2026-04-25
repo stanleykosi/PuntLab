@@ -103,7 +103,7 @@ async def test_get_llm_prefers_openai_primary_for_research_tasks(
     assert llm.provider_label == "openai"
     assert llm.kwargs["model"] == "gpt-4o"
     assert llm.kwargs["temperature"] == pytest.approx(0.3)
-    assert llm.kwargs["max_tokens"] == 500
+    assert llm.kwargs["max_tokens"] == 24000
     assert llm.kwargs["callbacks"] == []
     assert llm.kwargs["metadata"]["task"] == "research"
 
@@ -123,7 +123,7 @@ async def test_get_llm_falls_back_to_anthropic_when_openai_key_is_missing(
     assert llm.provider_label == "anthropic"
     assert llm.kwargs["model"] == "claude-sonnet-4-20250514"
     assert llm.kwargs["temperature"] == pytest.approx(0.3)
-    assert llm.kwargs["max_tokens"] == 300
+    assert llm.kwargs["max_tokens"] == 12000
     assert llm.kwargs["metadata"]["provider"] == "anthropic"
 
 
@@ -143,7 +143,7 @@ async def test_get_llm_uses_openrouter_with_openai_compatible_base_url(
     assert llm.kwargs["model"] == settings.llm.primary_model
     assert llm.kwargs["base_url"] == providers.OPENROUTER_BASE_URL
     assert llm.kwargs["default_headers"] == {"X-Title": "puntlab-agent"}
-    assert llm.kwargs["max_tokens"] == 150
+    assert llm.kwargs["max_tokens"] == 10000
 
 
 @pytest.mark.asyncio
@@ -159,7 +159,7 @@ async def test_get_llm_raises_clear_error_when_no_provider_credentials_exist(
         AllProvidersFailedError,
         match="Attempted providers: openrouter, openai, anthropic",
     ):
-        await get_llm("leg_rationale", settings=settings)
+        await get_llm("accumulator_rationale", settings=settings)
 
 
 def test_get_langfuse_handler_returns_none_without_complete_credentials() -> None:

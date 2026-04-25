@@ -1,152 +1,148 @@
-"""Tests for PuntLab's scoring pipeline node.
-
-Purpose: verify that the scoring stage turns researched fixtures into ordered
-`MatchScore` outputs and degrades gracefully when individual fixtures cannot
-be matched to supporting stats.
-Scope: unit tests for `src.pipeline.nodes.scoring`.
-Dependencies: pytest plus the canonical pipeline, fixture, context, odds, and
-team-stat schemas and the concrete scoring engine.
-"""
+"""Tests for the LLM-led scoring pipeline node."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 
 import pytest
 from src.config import MarketType, SportName
+from src.pipeline.nodes import scoring as scoring_module
 from src.pipeline.nodes.scoring import scoring_node
 from src.pipeline.state import PipelineStage, PipelineState
+from src.providers.odds_mapping import build_odds_market_catalog
 from src.schemas.analysis import MatchContext
+from src.schemas.fixture_details import FixtureDetails, FixtureDetailSection
 from src.schemas.fixtures import NormalizedFixture
 from src.schemas.odds import NormalizedOdds
-from src.schemas.stats import InjuryData, InjuryType, TeamStats
-from src.scoring import ScoringEngine
 
 
-def build_fixture(
-    *,
-    sportradar_id: str,
-    home_team: str,
-    away_team: str,
-) -> NormalizedFixture:
-    """Create a canonical soccer fixture used by scoring-node tests."""
+class FakeLLM:
+    """Minimal async chat model returning a JSON object as message content."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+        self.calls: list[object] = []
+
+    async def ainvoke(self, messages: object) -> object:
+        self.calls.append(messages)
+        return type("FakeMessage", (), {"content": json.dumps(self.payload)})()
+
+
+def build_fixture() -> NormalizedFixture:
+    """Create one fixture for scoring-node tests."""
 
     return NormalizedFixture(
-        sportradar_id=sportradar_id,
-        home_team=home_team,
-        away_team=away_team,
+        sportradar_id="sr:match:61301159",
+        home_team="Arsenal",
+        away_team="Chelsea",
         competition="Premier League",
         sport=SportName.SOCCER,
         kickoff=datetime(2026, 4, 4, 19, 0, tzinfo=UTC),
-        source_provider="api-football",
-        source_id=sportradar_id.split(":")[-1],
+        source_provider="sportybet",
+        source_id="61301159",
         country="England",
-        home_team_id=home_team.lower().replace(" ", "-"),
-        away_team_id=away_team.lower().replace(" ", "-"),
         venue="Emirates Stadium",
     )
 
 
-def build_team_stats(
-    *,
-    team_id: str,
-    team_name: str,
-    wins: int,
-    draws: int,
-    losses: int,
-    goals_for: int,
-    goals_against: int,
-    home_wins: int,
-    away_wins: int,
-    form: str,
-    avg_goals_scored: float,
-    avg_goals_conceded: float,
-    xg_diff: float,
-) -> TeamStats:
-    """Create one canonical team-stat snapshot for node-level scoring tests."""
-
-    return TeamStats(
-        team_id=team_id,
-        team_name=team_name,
-        sport=SportName.SOCCER,
-        source_provider="test-suite",
-        fetched_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
-        competition="Premier League",
-        season="2025-26",
-        matches_played=10,
-        wins=wins,
-        draws=draws,
-        losses=losses,
-        goals_for=goals_for,
-        goals_against=goals_against,
-        clean_sheets=3,
-        form=form,
-        points=(wins * 3) + draws,
-        home_wins=home_wins,
-        away_wins=away_wins,
-        avg_goals_scored=avg_goals_scored,
-        avg_goals_conceded=avg_goals_conceded,
-        advanced_metrics={"xg_diff": xg_diff},
-    )
-
-
-def build_odds_row(
-    *,
-    fixture_ref: str,
-    provider: str,
-    provider_selection_name: str,
-    odds: float,
-    line: float | None = None,
-) -> NormalizedOdds:
-    """Create one normalized odds row for scoring-node tests."""
+def build_odds_row(fixture_ref: str) -> NormalizedOdds:
+    """Create one SportyBet odds row available to the LLM prompt."""
 
     return NormalizedOdds(
         fixture_ref=fixture_ref,
-        market=None,
-        selection=provider_selection_name,
-        odds=odds,
-        provider=provider,
-        provider_market_name="Full Time Result" if line is None else "Goals Over/Under",
-        provider_selection_name=provider_selection_name,
-        provider_market_id=provider_selection_name.lower().replace(" ", "_"),
-        line=line,
+        market=MarketType.MATCH_RESULT,
+        selection="Home",
+        odds=1.84,
+        provider="sportybet",
+        provider_market_name="Full Time Result",
+        provider_selection_name="Arsenal",
+        provider_market_id=1,
         period="match",
         participant_scope="match",
-        raw_metadata={
-            "sport_key": "soccer_epl",
-            "home_team": "Arsenal",
-            "away_team": "Chelsea",
-        },
+        raw_metadata={"market_group_name": "Main"},
         last_updated=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
     )
 
 
 def build_context(fixture_ref: str) -> MatchContext:
-    """Create one qualitative context object for a scored fixture."""
+    """Create one LLM research context required by scoring."""
 
     return MatchContext(
         fixture_ref=fixture_ref,
-        morale_home=0.82,
-        morale_away=0.46,
-        rivalry_factor=0.72,
-        pressure_home=0.40,
-        pressure_away=0.68,
-        key_narrative="The home side arrives with stronger momentum and less pressure.",
+        fixture_detail_summary="SportyBet widgets show Arsenal with the cleaner setup.",
+        tactical_context="Arsenal probable XI is stable.",
+        statistical_context="Arsenal carry the stronger shot-volume indicators.",
+        availability_context="No major home absence captured.",
+        market_context="Home win is the shortest main-market price.",
+        supplemental_news_context="RSS supports Arsenal's home form.",
         qualitative_score=0.74,
-        data_sources=("BBC Sport", "Tavily"),
-        news_summary="Home morale is materially stronger heading into the fixture.",
+        data_sources=("SportyBet fixture-page widgets",),
+    )
+
+
+def build_fixture_details(fixture: NormalizedFixture) -> FixtureDetails:
+    """Create raw SportyBet fixture details supplied to market scoring."""
+
+    return FixtureDetails(
+        fixture_ref=fixture.get_fixture_ref(),
+        fixture_url="https://www.sportybet.com/ng/sport/football/england/premier-league/Arsenal_vs_Chelsea/sr:match:61301159",
+        event_id=fixture.sportradar_id or "sr:match:61301159",
+        match_id="61301159",
+        fetched_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        widget_loader_status="loaded",
+        sections=(
+            FixtureDetailSection(
+                widget_key="statistics",
+                widget_type="match.statistics",
+                status="mounted",
+                content_lines=("Shots: Arsenal 14.2 | Chelsea 10.1",),
+            ),
+        ),
     )
 
 
 @pytest.mark.asyncio
-async def test_scoring_node_generates_match_scores_and_advances_stage() -> None:
-    """The scoring node should produce `MatchScore` rows for scoreable fixtures."""
+async def test_scoring_node_uses_llm_json_for_market_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scoring node should validate the LLM's JSON MatchScore response."""
 
-    fixture = build_fixture(
-        sportradar_id="sr:match:61301159",
-        home_team="Arsenal",
-        away_team="Chelsea",
+    fixture = build_fixture()
+    odds_row = build_odds_row(fixture.get_fixture_ref())
+    llm = FakeLLM(
+        {
+            "fixture_ref": fixture.get_fixture_ref(),
+            "sport": "soccer",
+            "competition": "Premier League",
+            "home_team": "Arsenal",
+            "away_team": "Chelsea",
+            "composite_score": 0.81,
+            "confidence": 0.76,
+            "factors": {
+                "form": 0.8,
+                "h2h": 0.55,
+                "injury_impact": 0.7,
+                "odds_value": 0.72,
+                "context": 0.78,
+                "venue": 0.74,
+                "statistical": 0.68,
+            },
+            "recommended_market": "full_time_result",
+            "recommended_market_label": "Full Time Result",
+            "recommended_canonical_market": "1x2",
+            "recommended_selection": "Arsenal",
+            "recommended_odds": 1.84,
+            "recommended_line": None,
+            "qualitative_summary": "Arsenal have the clearer pre-match edge.",
+        }
     )
+    async def fake_get_llm(task: str) -> FakeLLM:
+        del task
+        return llm
+
+    monkeypatch.setattr(scoring_module, "get_llm", fake_get_llm)
+
     result = await scoring_node(
         PipelineState(
             run_id="run-2026-04-04-main",
@@ -154,91 +150,14 @@ async def test_scoring_node_generates_match_scores_and_advances_stage() -> None:
             started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
             current_stage=PipelineStage.SCORING,
             fixtures=[fixture],
-            odds_data=[
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Arsenal",
-                    odds=1.62,
-                ),
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Draw",
-                    odds=3.90,
-                ),
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Chelsea",
-                    odds=5.20,
-                ),
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Bet365",
-                    provider_selection_name="Arsenal",
-                    odds=1.64,
-                ),
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Bet365",
-                    provider_selection_name="Draw",
-                    odds=3.80,
-                ),
-                build_odds_row(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    provider="Bet365",
-                    provider_selection_name="Chelsea",
-                    odds=5.10,
-                ),
-            ],
-            team_stats=[
-                build_team_stats(
-                    team_id="arsenal",
-                    team_name="Arsenal",
-                    wins=8,
-                    draws=1,
-                    losses=1,
-                    goals_for=25,
-                    goals_against=9,
-                    home_wins=5,
-                    away_wins=3,
-                    form="WWWWDWWLWW",
-                    avg_goals_scored=2.5,
-                    avg_goals_conceded=0.9,
-                    xg_diff=0.9,
-                ),
-                build_team_stats(
-                    team_id="chelsea",
-                    team_name="Chelsea",
-                    wins=3,
-                    draws=2,
-                    losses=5,
-                    goals_for=12,
-                    goals_against=18,
-                    home_wins=2,
-                    away_wins=1,
-                    form="LDLLWDLLDL",
-                    avg_goals_scored=1.2,
-                    avg_goals_conceded=1.8,
-                    xg_diff=-0.4,
-                ),
-            ],
-            injuries=[
-                InjuryData(
-                    fixture_ref=fixture.get_fixture_ref(),
-                    team_id="chelsea",
-                    team_name="Chelsea",
-                    player_name="Reece James",
-                    source_provider="api-football",
-                    injury_type=InjuryType.INJURY,
-                    reported_at=datetime(2026, 4, 4, 6, 30, tzinfo=UTC),
-                )
-            ],
+            odds_market_catalog=build_odds_market_catalog(
+                (odds_row,),
+                sport_by_fixture={fixture.get_fixture_ref(): fixture.sport},
+            ),
             match_contexts=[build_context(fixture.get_fixture_ref())],
+            fixture_details=[build_fixture_details(fixture)],
             errors=["Earlier-stage warning."],
-        ),
-        engine=ScoringEngine(),
+        )
     )
 
     assert result["current_stage"] == PipelineStage.RANKING
@@ -247,223 +166,25 @@ async def test_scoring_node_generates_match_scores_and_advances_stage() -> None:
     score = result["match_scores"][0]
     assert score.fixture_ref == fixture.get_fixture_ref()
     assert score.recommended_market == "full_time_result"
-    assert score.recommended_market_label == "Full Time Result"
     assert score.recommended_canonical_market is MarketType.MATCH_RESULT
     assert score.recommended_selection == "Arsenal"
-    assert score.recommended_odds == pytest.approx(1.64)
-    assert score.confidence > 0.60
+    assert score.recommended_odds == pytest.approx(1.84)
+    assert llm.calls
 
 
 @pytest.mark.asyncio
-async def test_scoring_node_scores_unsupported_fixtures_without_forced_recommendations() -> None:
-    """Fixtures without exact stats should still score, but without forced picks."""
+async def test_scoring_node_fails_fast_without_research_context() -> None:
+    """Scoring should not fabricate a fallback context."""
 
-    scored_fixture = build_fixture(
-        sportradar_id="sr:match:7001",
-        home_team="Arsenal",
-        away_team="Chelsea",
-    )
-    failed_fixture = build_fixture(
-        sportradar_id="sr:match:7002",
-        home_team="Tottenham",
-        away_team="Liverpool",
-    )
-
-    result = await scoring_node(
-        PipelineState(
-            run_id="run-2026-04-04-main",
-            run_date=date(2026, 4, 4),
-            started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
-            current_stage=PipelineStage.SCORING,
-            fixtures=[scored_fixture, failed_fixture],
-            odds_data=[
-                build_odds_row(
-                    fixture_ref=scored_fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Arsenal",
-                    odds=1.70,
-                ),
-                build_odds_row(
-                    fixture_ref=scored_fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Draw",
-                    odds=3.70,
-                ),
-                build_odds_row(
-                    fixture_ref=scored_fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Chelsea",
-                    odds=4.80,
-                ),
-                build_odds_row(
-                    fixture_ref=failed_fixture.get_fixture_ref(),
-                    provider="Pinnacle",
-                    provider_selection_name="Tottenham",
-                    odds=2.20,
-                ),
-            ],
-            team_stats=[
-                build_team_stats(
-                    team_id="arsenal",
-                    team_name="Arsenal",
-                    wins=7,
-                    draws=2,
-                    losses=1,
-                    goals_for=20,
-                    goals_against=10,
-                    home_wins=4,
-                    away_wins=3,
-                    form="WWWDDWWLWW",
-                    avg_goals_scored=2.0,
-                    avg_goals_conceded=1.0,
-                    xg_diff=0.6,
-                ),
-                build_team_stats(
-                    team_id="chelsea",
-                    team_name="Chelsea",
-                    wins=4,
-                    draws=2,
-                    losses=4,
-                    goals_for=14,
-                    goals_against=15,
-                    home_wins=2,
-                    away_wins=2,
-                    form="LDWLWDLLDW",
-                    avg_goals_scored=1.4,
-                    avg_goals_conceded=1.5,
-                    xg_diff=-0.1,
-                ),
-            ],
-            match_contexts=[build_context(scored_fixture.get_fixture_ref())],
-            errors=[],
-        ),
-        engine=ScoringEngine(),
-    )
-
-    assert result["current_stage"] == PipelineStage.RANKING
-    assert len(result["match_scores"]) == 2
-    assert [score.fixture_ref for score in result["match_scores"]] == [
-        scored_fixture.get_fixture_ref(),
-        failed_fixture.get_fixture_ref(),
-    ]
-    assert result["match_scores"][0].recommended_selection == "Arsenal"
-    assert result["match_scores"][1].recommended_market is None
-    assert result["match_scores"][1].recommended_selection is None
-    assert result["errors"] == []
-
-
-@pytest.mark.asyncio
-async def test_scoring_node_keeps_repeated_missing_stats_fixtures_non_actionable() -> None:
-    """Repeated missing-stats fixtures should still score conservatively."""
-
-    failed_fixture_one = build_fixture(
-        sportradar_id="sr:match:7101",
-        home_team="Tottenham",
-        away_team="Liverpool",
-    )
-    failed_fixture_two = build_fixture(
-        sportradar_id="sr:match:7102",
-        home_team="Newcastle",
-        away_team="Brentford",
-    )
-
-    result = await scoring_node(
-        PipelineState(
-            run_id="run-2026-04-04-grouped",
-            run_date=date(2026, 4, 4),
-            started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
-            current_stage=PipelineStage.SCORING,
-            fixtures=[failed_fixture_one, failed_fixture_two],
-            odds_data=[],
-            team_stats=[
-                build_team_stats(
-                    team_id="arsenal",
-                    team_name="Arsenal",
-                    wins=7,
-                    draws=2,
-                    losses=1,
-                    goals_for=20,
-                    goals_against=10,
-                    home_wins=4,
-                    away_wins=3,
-                    form="WWWDDWWLWW",
-                    avg_goals_scored=2.0,
-                    avg_goals_conceded=1.0,
-                    xg_diff=0.6,
-                ),
-            ],
-            match_contexts=[],
-            errors=[],
-        ),
-        engine=ScoringEngine(),
-    )
-
-    assert len(result["match_scores"]) == 2
-    assert [score.fixture_ref for score in result["match_scores"]] == [
-        failed_fixture_one.get_fixture_ref(),
-        failed_fixture_two.get_fixture_ref(),
-    ]
-    assert all(score.recommended_market is None for score in result["match_scores"])
-    assert all(score.recommended_selection is None for score in result["match_scores"])
-    assert result["errors"] == []
-
-
-@pytest.mark.asyncio
-async def test_scoring_node_groups_fixture_specific_reasons_after_normalization() -> None:
-    """Fixture IDs embedded in scoring exceptions should still aggregate by cause."""
-
-    class FailingEngine:
-        """Test-only scoring engine that raises fixture-specific errors."""
-
-        def calculate_match_score(
-            self,
-            fixture: NormalizedFixture,
-            team_stats: list[TeamStats],
-            odds_data: list[NormalizedOdds],
-            *,
-            context: MatchContext | None = None,
-            injuries: list[InjuryData] | None = None,
-            h2h_data: object | None = None,
-        ) -> object:
-            """Raise one deterministic fixture-specific failure message."""
-
-            del team_stats, odds_data, context, injuries, h2h_data
-            raise ValueError(
-                "No finished historical meetings are available for fixture "
-                f"{fixture.get_fixture_ref()}."
+    fixture = build_fixture()
+    with pytest.raises(RuntimeError, match="requires research context"):
+        await scoring_node(
+            PipelineState(
+                run_id="run-2026-04-04-main",
+                run_date=date(2026, 4, 4),
+                started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+                current_stage=PipelineStage.SCORING,
+                fixtures=[fixture],
+                match_contexts=[],
             )
-
-    failed_fixture_one = build_fixture(
-        sportradar_id="sr:match:7301",
-        home_team="Tottenham",
-        away_team="Liverpool",
-    )
-    failed_fixture_two = build_fixture(
-        sportradar_id="sr:match:7302",
-        home_team="Newcastle",
-        away_team="Brentford",
-    )
-
-    result = await scoring_node(
-        PipelineState(
-            run_id="run-2026-04-04-grouped-normalized",
-            run_date=date(2026, 4, 4),
-            started_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
-            current_stage=PipelineStage.SCORING,
-            fixtures=[failed_fixture_one, failed_fixture_two],
-            odds_data=[],
-            team_stats=[],
-            match_contexts=[],
-            errors=[],
-        ),
-        engine=FailingEngine(),  # type: ignore[arg-type]
-    )
-
-    assert result["match_scores"] == []
-    assert result["errors"] == [
-        (
-            "Scoring failed for 2 fixtures due to: No finished historical meetings are "
-            "available for fixture <fixture>. "
-            "Sample fixtures: sr:match:7301, sr:match:7302."
         )
-    ]
